@@ -3,118 +3,202 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1c1d21">
   <title>Skip Opening Chess</title>
-  <meta name="description" content="Play chess with a friend online. Skip the opening — and let the rating gap decide who starts ahead.">
+  <meta name="description" content="Play chess online, against the computer or on one device. Skip the opening, and let the rating gap decide who starts ahead.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>♞</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
   <link rel="stylesheet" href="vendor/chessground/chessground.base.css">
   <link rel="stylesheet" href="vendor/chessground/chessground.cburnett.css">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="top">
-    <a class="brand" href="./">♞ Skip Opening Chess</a>
+    <a class="brand" href="./"><span class="brand-mark">♞</span><span>Skip Opening Chess</span></a>
     <span class="conn" id="conn" hidden></span>
   </header>
 
   <main>
     <!-- Create a game -->
-    <section class="card" id="screen-create" hidden>
-      <h1>Skip the opening.<br>Play anyone.</h1>
-      <p class="lead">The engine plays the first moves for you. If your opponent is rated differently,
-        the opening tilts toward the lower-rated player, so the game is fair from move one.</p>
-      <form id="create-form" class="form">
-        <fieldset class="seg seg-mode">
-          <legend>How do you want to play?</legend>
-          <label><input type="radio" name="mode" value="online" checked><span>🌐 Online friend</span></label>
-          <label><input type="radio" name="mode" value="bot"><span>🤖 Computer</span></label>
-          <label><input type="radio" name="mode" value="local"><span>👥 Same device</span></label>
+    <section class="card setup" id="screen-create" hidden>
+      <div class="hero">
+        <h1>Skip the opening.<br><span>Play anyone.</span></h1>
+        <p class="lead">The engine plays the first moves. If ratings differ, the opening tilts toward the
+          lower-rated player, so the game is fair from move one.</p>
+      </div>
+
+      <form id="create-form" class="form" novalidate>
+        <div class="modes" role="radiogroup" aria-label="How do you want to play?">
+          <label class="mode">
+            <input type="radio" name="mode" value="online" checked>
+            <span class="mode-box">
+              <span class="mode-icon" aria-hidden="true">🌐</span>
+              <span class="mode-title">Online</span>
+              <span class="mode-sub">Send a link</span>
+            </span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="mode" value="bot">
+            <span class="mode-box">
+              <span class="mode-icon" aria-hidden="true">🤖</span>
+              <span class="mode-title">Computer</span>
+              <span class="mode-sub">Practice</span>
+            </span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="mode" value="local">
+            <span class="mode-box">
+              <span class="mode-icon" aria-hidden="true">👥</span>
+              <span class="mode-title">Same device</span>
+              <span class="mode-sub">Pass &amp; play</span>
+            </span>
+          </label>
+        </div>
+
+        <fieldset class="group">
+          <legend>Players</legend>
+          <div class="row2">
+            <label class="field"><span class="field-label" data-label-local="Player 1">Your name</span>
+              <input name="name" maxlength="20" placeholder="e.g. Elad" autocomplete="nickname">
+            </label>
+            <label class="field"><span class="field-label" data-label-local="Player 1 rating">Your rating</span>
+              <input name="rating" type="number" inputmode="numeric" min="100" max="3500" step="1" value="1200">
+            </label>
+          </div>
+          <div class="row2" data-show="local">
+            <label class="field"><span class="field-label">Player 2</span>
+              <input name="name2" maxlength="20" placeholder="e.g. Dana">
+            </label>
+            <label class="field"><span class="field-label">Player 2 rating</span>
+              <input name="rating2" type="number" inputmode="numeric" min="100" max="3500" step="1" value="1200">
+            </label>
+          </div>
+          <label class="field" data-show="bot">
+            <span class="field-label">Computer strength <output class="pill" id="bot-out">1200</output></span>
+            <input class="range" name="botRating" type="range" min="400" max="2800" step="50" value="1200">
+            <span class="range-ends"><span>Beginner</span><span>Master</span></span>
+          </label>
         </fieldset>
-        <div class="row2">
-          <label><span data-label-local="Player 1 name">Your name</span>
-            <input name="name" maxlength="20" placeholder="e.g. Elad" required>
+
+        <fieldset class="group">
+          <legend>Opening</legend>
+          <label class="field">
+            <span class="field-label">Moves to simulate <output class="pill" id="turns-out">8</output></span>
+            <input class="range" name="turns" type="range" min="0" max="20" value="8">
+            <span class="range-ends"><span>Normal game</span><span>20 moves</span></span>
           </label>
-          <label><span data-label-local="Player 1 rating">Your rating</span>
-            <input name="rating" type="number" min="100" max="3500" step="1" value="1200" required>
+          <label class="field">
+            <span class="field-label">Opening style <output class="pill" id="style-out">Mainstream</output></span>
+            <input class="range" name="style" type="range" min="0" max="100" value="25">
+            <span class="range-ends"><span>Classic</span><span>Crazy</span></span>
           </label>
-        </div>
-        <div class="row2" data-show="local">
-          <label>Player 2 name
-            <input name="name2" maxlength="20" placeholder="e.g. Dana">
-          </label>
-          <label>Player 2 rating
-            <input name="rating2" type="number" min="100" max="3500" step="1" value="1200">
-          </label>
-        </div>
-        <label data-show="bot">Computer strength <output id="bot-out">1200</output>
-          <input name="botRating" type="range" min="400" max="2800" step="50" value="1200">
-          <span class="range-ends"><span>Beginner</span><span>Master</span></span>
-        </label>
-        <label>Moves to simulate <output id="turns-out">8</output>
-          <input name="turns" type="range" min="0" max="20" value="8">
-        </label>
-        <label>Opening style <output id="style-out">Mainstream</output>
-          <input name="style" type="range" min="0" max="100" value="25">
-          <span class="range-ends"><span>Classic</span><span>Crazy</span></span>
-        </label>
-        <label>Time control
-          <select name="tc">
-            <option value="">No clock</option>
-            <option value="1+0">1 min · Bullet</option>
-            <option value="2+1">2 | 1 · Bullet</option>
-            <option value="3+0">3 min · Blitz</option>
-            <option value="3+2">3 | 2 · Blitz</option>
-            <option value="5+0">5 min · Blitz</option>
-            <option value="5+3">5 | 3 · Blitz</option>
-            <option value="10+0" selected>10 min · Rapid</option>
-            <option value="10+5">10 | 5 · Rapid</option>
-            <option value="15+10">15 | 10 · Rapid</option>
-            <option value="30+0">30 min · Classical</option>
-            <option value="30+20">30 | 20 · Classical</option>
-            <option value="custom">Custom…</option>
-          </select>
-        </label>
-        <div class="row2" id="tc-custom" hidden>
-          <label>Minutes per player
-            <input name="tcMin" type="number" min="0.5" max="180" step="0.5" value="7">
-          </label>
-          <label>Increment (seconds)
-            <input name="tcInc" type="number" min="0" max="60" step="1" value="2">
-          </label>
-        </div>
-        <fieldset class="seg">
-          <legend data-label-local="Player 1 plays">Your color</legend>
-          <label><input type="radio" name="color" value="w"><span>White</span></label>
-          <label><input type="radio" name="color" value="random" checked><span>Random</span></label>
-          <label><input type="radio" name="color" value="b"><span>Black</span></label>
         </fieldset>
-        <label class="check" data-show="local"><input type="checkbox" name="autoFlip"> Flip the board after every move</label>
-        <button class="btn primary" type="submit" id="create-btn">Create game &amp; get link</button>
+
+        <fieldset class="group">
+          <legend>Time control <output class="pill" id="tc-out">10 min · Rapid</output></legend>
+          <div class="tc">
+            <div class="tc-row">
+              <span class="tc-cat"><span aria-hidden="true">⚡</span> Bullet</span>
+              <div class="chips">
+                <label class="chip"><input type="radio" name="tc" value="1+0"><span>1 min</span></label>
+                <label class="chip"><input type="radio" name="tc" value="2+1"><span>2 | 1</span></label>
+              </div>
+            </div>
+            <div class="tc-row">
+              <span class="tc-cat"><span aria-hidden="true">🔥</span> Blitz</span>
+              <div class="chips">
+                <label class="chip"><input type="radio" name="tc" value="3+0"><span>3 min</span></label>
+                <label class="chip"><input type="radio" name="tc" value="3+2"><span>3 | 2</span></label>
+                <label class="chip"><input type="radio" name="tc" value="5+0"><span>5 min</span></label>
+                <label class="chip"><input type="radio" name="tc" value="5+3"><span>5 | 3</span></label>
+              </div>
+            </div>
+            <div class="tc-row">
+              <span class="tc-cat"><span aria-hidden="true">⏱️</span> Rapid</span>
+              <div class="chips">
+                <label class="chip"><input type="radio" name="tc" value="10+0" checked><span>10 min</span></label>
+                <label class="chip"><input type="radio" name="tc" value="10+5"><span>10 | 5</span></label>
+                <label class="chip"><input type="radio" name="tc" value="15+10"><span>15 | 10</span></label>
+              </div>
+            </div>
+            <div class="tc-row">
+              <span class="tc-cat"><span aria-hidden="true">🐢</span> Classical</span>
+              <div class="chips">
+                <label class="chip"><input type="radio" name="tc" value="30+0"><span>30 min</span></label>
+                <label class="chip"><input type="radio" name="tc" value="30+20"><span>30 | 20</span></label>
+              </div>
+            </div>
+            <div class="tc-row">
+              <span class="tc-cat"><span aria-hidden="true">⚙️</span> Other</span>
+              <div class="chips">
+                <label class="chip"><input type="radio" name="tc" value=""><span>No clock</span></label>
+                <label class="chip"><input type="radio" name="tc" value="custom"><span>Custom</span></label>
+              </div>
+            </div>
+          </div>
+          <div class="custom-tc" id="tc-custom" hidden>
+            <div class="stepper">
+              <span class="field-label">Minutes</span>
+              <div class="stepper-box">
+                <button type="button" class="step" data-step="tcMin" data-delta="-1" aria-label="Fewer minutes">−</button>
+                <input name="tcMin" type="number" inputmode="decimal" min="0.5" max="180" step="0.5" value="7">
+                <button type="button" class="step" data-step="tcMin" data-delta="1" aria-label="More minutes">+</button>
+              </div>
+            </div>
+            <div class="stepper">
+              <span class="field-label">Increment (sec)</span>
+              <div class="stepper-box">
+                <button type="button" class="step" data-step="tcInc" data-delta="-1" aria-label="Less increment">−</button>
+                <input name="tcInc" type="number" inputmode="numeric" min="0" max="60" step="1" value="2">
+                <button type="button" class="step" data-step="tcInc" data-delta="1" aria-label="More increment">+</button>
+              </div>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend data-label-local="Player 1 plays">You play</legend>
+          <div class="colors">
+            <label class="color-opt"><input type="radio" name="color" value="w"><span><i class="pc white" aria-hidden="true">♚</i>White</span></label>
+            <label class="color-opt"><input type="radio" name="color" value="random" checked><span><i class="pc rnd" aria-hidden="true">?</i>Random</span></label>
+            <label class="color-opt"><input type="radio" name="color" value="b"><span><i class="pc black" aria-hidden="true">♚</i>Black</span></label>
+          </div>
+          <label class="check" data-show="local"><input type="checkbox" name="autoFlip"><span>Flip the board after every move</span></label>
+        </fieldset>
+
+        <button class="btn primary big" type="submit" id="create-btn">Create game &amp; get link</button>
       </form>
     </section>
 
     <!-- Waiting for the friend -->
-    <section class="card" id="screen-wait" hidden>
+    <section class="card narrow" id="screen-wait" hidden>
+      <div class="wait-icon" aria-hidden="true">🔗</div>
       <h2>Send this link to your friend</h2>
+      <p class="lead">When they open it and enter their rating, the game starts automatically.</p>
       <div class="linkbox">
-        <input id="share-link" readonly>
+        <input id="share-link" readonly aria-label="Game link">
         <button class="btn primary" id="copy-link" type="button">Copy</button>
       </div>
-      <button class="btn ghost" id="native-share" type="button" hidden>Share…</button>
-      <p class="muted"><span class="spinner"></span> Waiting for your friend to join. Keep this tab open.</p>
+      <button class="btn ghost wide" id="native-share" type="button" hidden>Share…</button>
+      <p class="muted"><span class="spinner"></span> Waiting for your friend. Keep this tab open.</p>
     </section>
 
     <!-- Join a game -->
-    <section class="card" id="screen-join" hidden>
+    <section class="card narrow" id="screen-join" hidden>
       <h2 id="join-title">Connecting…</h2>
       <p class="lead" id="join-sub"></p>
       <form id="join-form" class="form" hidden>
-        <label>Your name
-          <input name="name" maxlength="20" placeholder="Your name" required>
-        </label>
-        <label>Your rating
-          <input name="rating" type="number" min="100" max="3500" step="1" value="1200" required>
-        </label>
-        <button class="btn primary" type="submit">Join game</button>
+        <div class="row2">
+          <label class="field"><span class="field-label">Your name</span>
+            <input name="name" maxlength="20" placeholder="Your name" autocomplete="nickname">
+          </label>
+          <label class="field"><span class="field-label">Your rating</span>
+            <input name="rating" type="number" inputmode="numeric" min="100" max="3500" step="1" value="1200">
+          </label>
+        </div>
+        <button class="btn primary big" type="submit">Join game</button>
       </form>
     </section>
 
@@ -131,25 +215,29 @@
         <div class="player bottom-player" id="player-bottom"></div>
       </div>
       <aside class="side">
-        <div class="status" id="status"></div>
-        <div class="handicap" id="handicap" hidden></div>
-        <details class="learn" id="learn" hidden>
+        <div class="panel status-panel">
+          <div class="status" id="status"></div>
+        </div>
+        <div class="panel handicap" id="handicap" hidden></div>
+        <details class="panel learn" id="learn" hidden>
           <summary><span class="learn-title">📖 Learn this opening</span><span class="learn-name" id="learn-name"></span></summary>
           <div class="learn-body" id="learn-body"></div>
         </details>
-        <ol class="moves" id="moves"></ol>
-        <div class="review" id="review">
-          <button class="btn ghost icon" id="nav-first" type="button" title="First move" aria-label="First move">⏮</button>
-          <button class="btn ghost icon" id="nav-prev" type="button" title="Previous move" aria-label="Previous move">◀</button>
-          <button class="btn ghost icon" id="nav-next" type="button" title="Next move" aria-label="Next move">▶</button>
-          <button class="btn ghost icon" id="nav-last" type="button" title="Back to the game" aria-label="Back to the game">⏭</button>
+        <div class="panel moves-panel">
+          <ol class="moves" id="moves"></ol>
+          <div class="review" id="review">
+            <button class="nav" id="nav-first" type="button" title="First move" aria-label="First move"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14M18 6l-8 6 8 6"/></svg></button>
+            <button class="nav" id="nav-prev" type="button" title="Previous move (←)" aria-label="Previous move"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
+            <button class="nav" id="nav-next" type="button" title="Next move (→)" aria-label="Next move"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+            <button class="nav" id="nav-last" type="button" title="Back to the game" aria-label="Back to the game"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5v14M6 6l8 6-8 6"/></svg></button>
+          </div>
         </div>
+        <div class="notice" id="notice" hidden></div>
         <div class="actions" id="actions">
           <button class="btn" id="btn-draw" type="button">½ Offer draw</button>
           <button class="btn" id="btn-resign" type="button">⚑ Resign</button>
-          <button class="btn ghost" id="btn-flip" type="button">⇅ Flip</button>
+          <button class="btn ghost" id="btn-flip" type="button" title="Flip board" aria-label="Flip board">⇅</button>
         </div>
-        <div class="notice" id="notice" hidden></div>
       </aside>
     </section>
   </main>

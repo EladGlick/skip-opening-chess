@@ -106,10 +106,11 @@ function initCreate() {
   if (profile.name2) f.name2.value = profile.name2;
   if (profile.rating2) f.rating2.value = profile.rating2;
   if (profile.botRating) f.botRating.value = profile.botRating;
-  if (profile.tc != null && [...f.tc.options].some(o => o.value === profile.tc)) f.tc.value = profile.tc;
+  const tcRadios = [...f.querySelectorAll('input[name=tc]')];
+  if (profile.tc != null && tcRadios.some(r => r.value === profile.tc)) f.tc.value = profile.tc;
   if (profile.mode) f.mode.value = profile.mode;
   const out = $('turns-out');
-  const sync = () => { out.textContent = f.turns.value === '0' ? '0 (normal game)' : f.turns.value; };
+  const sync = () => { out.textContent = f.turns.value === '0' ? 'Off' : `${f.turns.value} moves`; };
   f.turns.addEventListener('input', sync); sync();
   if (profile.style != null) f.style.value = profile.style;
   const syncStyle = () => { $('style-out').textContent = styleLabel(+f.style.value); };
@@ -117,8 +118,41 @@ function initCreate() {
   const botLevel = v => v < 800 ? 'Beginner' : v < 1200 ? 'Casual' : v < 1600 ? 'Club player' : v < 2000 ? 'Strong' : v < 2400 ? 'Expert' : 'Master';
   const syncBot = () => { $('bot-out').textContent = `${f.botRating.value} · ${botLevel(+f.botRating.value)}`; };
   f.botRating.addEventListener('input', syncBot); syncBot();
-  const syncTc = () => { $('tc-custom').hidden = f.tc.value !== 'custom'; };
-  f.tc.addEventListener('change', syncTc); syncTc();
+  const tcCategory = (min, inc) => {
+    const est = min + (inc * 40) / 60;           // estimated minutes per player for a 40-move game
+    return est < 3 ? 'Bullet' : est < 8 ? 'Blitz' : est < 25 ? 'Rapid' : 'Classical';
+  };
+  const syncTc = () => {
+    const v = f.tc.value;
+    $('tc-custom').hidden = v !== 'custom';
+    let label;
+    if (!v) label = 'No clock';
+    else {
+      const [min, inc] = v === 'custom' ? [+f.tcMin.value || 0, +f.tcInc.value || 0] : v.split('+').map(Number);
+      label = `${inc ? `${min} | ${inc}` : `${min} min`} · ${tcCategory(min, inc)}`;
+    }
+    $('tc-out').textContent = label;
+  };
+  for (const r of tcRadios) r.addEventListener('change', syncTc);
+  f.tcMin.addEventListener('input', syncTc);
+  f.tcInc.addEventListener('input', syncTc);
+  for (const b of f.querySelectorAll('.step')) {
+    b.addEventListener('click', () => {
+      const inp = f[b.dataset.step];
+      const step = inp.name === 'tcMin' && +inp.value < 2 ? 0.5 : 1;
+      const v = Math.min(+inp.max, Math.max(+inp.min, (+inp.value || 0) + step * +b.dataset.delta));
+      inp.value = v;
+      syncTc();
+    });
+  }
+  syncTc();
+
+  // slider fill
+  for (const r of f.querySelectorAll('.range')) {
+    const paint = () => r.style.setProperty('--pct', `${((r.value - r.min) / (r.max - r.min)) * 100}%`);
+    r.addEventListener('input', paint);
+    paint();
+  }
 
   const syncMode = () => {
     const mode = f.mode.value;
@@ -127,7 +161,7 @@ function initCreate() {
       if (!el.dataset.labelDefault) el.dataset.labelDefault = el.textContent;
       el.textContent = mode === 'local' ? el.dataset.labelLocal : el.dataset.labelDefault;
     }
-    $('create-btn').textContent = mode === 'online' ? 'Create game & get link' : 'Start game';
+    $('create-btn').textContent = mode === 'online' ? 'Create game & get link' : mode === 'bot' ? 'Play the computer' : 'Start game';
   };
   for (const r of f.mode) r.addEventListener('change', syncMode);
   syncMode();
@@ -169,7 +203,7 @@ function initCreate() {
       render();
     } else {
       if (mode === 'bot') getBotEngine();
-      setConn(mode === 'bot' ? 'Offline · vs computer' : 'Offline · same device', 'on');
+      setConn(mode === 'bot' ? 'vs computer' : 'Same device', 'on');
       startGame(pickWhite());
     }
   });
@@ -1089,7 +1123,7 @@ if (!gameId) {
     if (state.phase === 'simulating' || !state.guest) getEngine();
     if (state.mode === 'online') startHost();
     else {
-      setConn(state.mode === 'bot' ? 'Offline · vs computer' : 'Offline · same device', 'on');
+      setConn(state.mode === 'bot' ? 'vs computer' : 'Same device', 'on');
       if (state.phase === 'simulating') runSimulation();
       maybeBotMove();
     }
