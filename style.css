@@ -136,6 +136,25 @@ input[type=range] { accent-color: var(--accent); width: 100%; }
 .notice { background: var(--panel-2); padding: 10px 12px; border-radius: 8px; font-size: 14px; display: grid; gap: 8px; }
 .notice .row { display: flex; gap: 8px; }
 
+/* Create form extras */
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.seg-mode span { font-size: 14px; padding: 10px 4px; }
+.form select {
+  background: var(--bg); border: 1px solid #4a474f; color: var(--text);
+  border-radius: 8px; padding: 10px 12px; font-size: 16px; width: 100%;
+}
+.form label.check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text); font-weight: 500; }
+.check input { accent-color: var(--accent); width: 18px; height: 18px; }
+
+/* Clocks */
+.clock {
+  margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700; font-size: 22px;
+  background: #1e1d22; color: var(--muted); padding: 4px 12px; border-radius: 6px; min-width: 96px; text-align: right;
+}
+.clock.running { background: #f3f3f3; color: #1b1b1b; }
+.clock.low { color: #fff; background: var(--danger); }
+.player .turn-dot { display: none; }
+
 /* Opening style slider */
 .range-ends { display: flex; justify-content: space-between; font-weight: 500; font-size: 12px; margin-top: -2px; }
 
@@ -231,5 +250,7 @@ cg-board square.current-premove { background-color: rgba(20, 30, 85, .5); }
   .moves { max-height: 180px; }
   .learn-body { max-height: none; }
   .card { padding: 22px 18px; margin-top: 1vh; }
+  .clock { font-size: 18px; min-width: 80px; padding: 3px 8px; }
+  .seg-mode span { font-size: 12.5px; }
   .top { padding: 10px 12px; }
 }

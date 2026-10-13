@@ -1,6 +1,6 @@
 import { Chess } from './vendor/chess.js';
 import { Chessground } from './vendor/chessground/chessground.min.js';
-import { simulateOpening, getEngine, targetAdvantage } from './engine.js';
+import { simulateOpening, getEngine, getBotEngine, botMove, quickEval, targetAdvantage } from './engine.js';
 import { loadOpenings, identify, describe, styleLabel, lichessOpeningUrl, lichessAnalysisUrl, wikipediaUrl } from './openings.js';
 
 /* ------------------------------------------------------------------ */
@@ -62,6 +62,11 @@ let simulating = false;
 let lastRenderedKey = '';
 let viewPly = null;        // null = live position; otherwise number of plies shown while reviewing
 let autoplay = null;
+let clockOffset = 0;       // guest: host clock minus local clock
+let liveTurn = 'w';        // side to move in the live position (cached by render)
+let botThinking = false;
+let uiNote = null;         // short-lived message shown under the buttons
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const profile = store.get('profile') || {};
 
@@ -81,31 +86,76 @@ function setConn(text, cls) {
 /* ------------------------------------------------------------------ */
 /* Create screen                                                       */
 /* ------------------------------------------------------------------ */
+function parseTc(f) {
+  const v = f.tc.value;
+  if (!v) return null;
+  if (v === 'custom') {
+    const base = Math.max(0.5, +f.tcMin.value || 5) * 60000;
+    return { base, inc: Math.max(0, +f.tcInc.value || 0) * 1000 };
+  }
+  const [m, i] = v.split('+').map(Number);
+  return { base: m * 60000, inc: i * 1000 };
+}
+const tcLabel = tc => (tc ? `${+(tc.base / 60000).toFixed(1)}+${tc.inc / 1000}` : 'no clock');
+
 function initCreate() {
   show('screen-create');
   const f = $('create-form');
   if (profile.name) f.name.value = profile.name;
   if (profile.rating) f.rating.value = profile.rating;
+  if (profile.name2) f.name2.value = profile.name2;
+  if (profile.rating2) f.rating2.value = profile.rating2;
+  if (profile.botRating) f.botRating.value = profile.botRating;
+  if (profile.tc != null && [...f.tc.options].some(o => o.value === profile.tc)) f.tc.value = profile.tc;
+  if (profile.mode) f.mode.value = profile.mode;
   const out = $('turns-out');
   const sync = () => { out.textContent = f.turns.value === '0' ? '0 (normal game)' : f.turns.value; };
   f.turns.addEventListener('input', sync); sync();
   if (profile.style != null) f.style.value = profile.style;
   const syncStyle = () => { $('style-out').textContent = styleLabel(+f.style.value); };
   f.style.addEventListener('input', syncStyle); syncStyle();
+  const botLevel = v => v < 800 ? 'Beginner' : v < 1200 ? 'Casual' : v < 1600 ? 'Club player' : v < 2000 ? 'Strong' : v < 2400 ? 'Expert' : 'Master';
+  const syncBot = () => { $('bot-out').textContent = `${f.botRating.value} · ${botLevel(+f.botRating.value)}`; };
+  f.botRating.addEventListener('input', syncBot); syncBot();
+  const syncTc = () => { $('tc-custom').hidden = f.tc.value !== 'custom'; };
+  f.tc.addEventListener('change', syncTc); syncTc();
+
+  const syncMode = () => {
+    const mode = f.mode.value;
+    for (const el of f.querySelectorAll('[data-show]')) el.hidden = el.dataset.show !== mode;
+    for (const el of f.querySelectorAll('[data-label-local]')) {
+      if (!el.dataset.labelDefault) el.dataset.labelDefault = el.textContent;
+      el.textContent = mode === 'local' ? el.dataset.labelLocal : el.dataset.labelDefault;
+    }
+    $('create-btn').textContent = mode === 'online' ? 'Create game & get link' : 'Start game';
+  };
+  for (const r of f.mode) r.addEventListener('change', syncMode);
+  syncMode();
+
   f.addEventListener('submit', e => {
     e.preventDefault();
-    const name = f.name.value.trim() || 'Host';
+    const mode = f.mode.value;
+    const name = f.name.value.trim() || (mode === 'local' ? 'Player 1' : 'Host');
     const rating = Math.round(+f.rating.value) || 1200;
-    store.set('profile', { ...profile, name, rating, style: +f.style.value });
+    const name2 = f.name2.value.trim() || 'Player 2';
+    const rating2 = Math.round(+f.rating2.value) || 1200;
+    const botRating = +f.botRating.value;
+    store.set('profile', { ...profile, name, rating, style: +f.style.value, mode, tc: f.tc.value,
+      botRating, name2: f.name2.value.trim(), rating2 });
     gameId = randId();
     state = {
       id: gameId, v: 0, game: 1,
+      mode,
       phase: 'lobby',
       turns: +f.turns.value,
       style: +f.style.value,
+      tc: parseTc(f),
+      clock: null,
+      autoFlip: f.autoFlip.checked,
       colorPref: f.color.value,
       host: { name, rating },
-      guest: null,
+      guest: mode === 'bot' ? { name: 'Computer', rating: botRating, bot: true }
+        : mode === 'local' ? { name: name2, rating: rating2 } : null,
       white: null,
       moves: [], simCount: 0, sim: null,
       result: null, drawOffer: null, rematch: { host: false, guest: false },
@@ -113,9 +163,15 @@ function initCreate() {
     role = 'host';
     saveHost();
     history.replaceState(null, '', `?game=${gameId}` + (SIGNAL ? `&signal=${SIGNAL}` : ''));
-    getEngine(); // start loading Stockfish now so it's warm when the friend joins
-    startHost();
-    render();
+    getEngine(); // start loading Stockfish now so it's warm
+    if (mode === 'online') {
+      startHost();
+      render();
+    } else {
+      if (mode === 'bot') getBotEngine();
+      setConn(mode === 'bot' ? 'Offline · vs computer' : 'Offline · same device', 'on');
+      startGame(pickWhite());
+    }
   });
 }
 
@@ -157,8 +213,9 @@ function startHost() {
 function broadcast() {
   state.v++;
   saveHost();
-  if (conn && conn.open) conn.send({ t: 'state', state });
+  if (conn && conn.open) conn.send({ t: 'state', state, now: Date.now() });
   render();
+  maybeBotMove();
 }
 
 function hostHandle(c, msg) {
@@ -169,9 +226,9 @@ function hostHandle(c, msg) {
       if (state.guest && state.guest.token === msg.token) {
         conn = c;
         setConn(`Connected to ${state.guest.name}`, 'on');
-        c.send({ t: 'state', state });
+        c.send({ t: 'state', state, now: Date.now() });
       } else if (!state.guest) {
-        c.send({ t: 'invite', host: state.host, turns: state.turns, style: state.style ?? 25 });
+        c.send({ t: 'invite', host: state.host, turns: state.turns, style: state.style ?? 25, tc: state.tc || null });
       } else {
         c.send({ t: 'full' });
       }
@@ -201,7 +258,7 @@ function pickWhite() {
 function startGame(white) {
   viewPly = null; stopAutoplay();
   Object.assign(state, {
-    white, phase: 'simulating', moves: [], simCount: 0, sim: null,
+    white, phase: 'simulating', moves: [], simCount: 0, sim: null, clock: null,
     result: null, drawOffer: null, rematch: { host: false, guest: false },
   });
   broadcast();
@@ -232,6 +289,7 @@ async function runSimulation() {
     const r = resultOf(chessFrom(state.moves));
     state.phase = r ? 'over' : 'playing';
     state.result = r;
+    state.clock = state.tc && !r ? { w: state.tc.base, b: state.tc.base, since: Date.now() } : null;
   } catch (err) {
     console.error(err);
     alert('The opening engine failed to load. Try refreshing the page.');
@@ -252,26 +310,33 @@ function actOn(who, msg) {
       let m;
       try { m = c.move(msg.move); } catch { m = null; }
       if (!m) { conn?.send({ t: 'state', state }); return; }
+      if (state.clock?.since) {
+        const now = Date.now();
+        const rem = state.clock[color] - (now - state.clock.since);
+        if (rem <= 0) { flag(color); return; }
+        state.clock[color] = rem + state.tc.inc;
+        state.clock.since = now;
+      }
       state.moves.push(m.san);
       state.drawOffer = null;
       const r = resultOf(c);
-      if (r) { state.result = r; state.phase = 'over'; }
+      if (r) endGame(r);
       break;
     }
     case 'resign':
       if (state.phase !== 'playing') return;
-      state.result = { winner: other(color), reason: `${colorName(color)} resigned` };
-      state.phase = 'over';
+      endGame({ winner: other(color), reason: `${colorName(color)} resigned` });
       break;
     case 'offerDraw':
       if (state.phase !== 'playing' || state.drawOffer) return;
+      if (state.mode === 'local') { endGame({ winner: null, reason: 'agreement' }); break; }
       state.drawOffer = color;
+      if (state.mode === 'bot') botConsiderDraw();
       break;
     case 'acceptDraw':
       if (state.phase !== 'playing' || state.drawOffer !== other(color)) return;
-      state.result = { winner: null, reason: 'agreement' };
-      state.phase = 'over';
       state.drawOffer = null;
+      endGame({ winner: null, reason: 'agreement' });
       break;
     case 'declineDraw':
       if (state.drawOffer !== other(color)) return;
@@ -280,7 +345,7 @@ function actOn(who, msg) {
     case 'rematch':
       if (state.phase !== 'over') return;
       state.rematch[who] = true;
-      if (state.rematch.host && state.rematch.guest) {
+      if (state.mode !== 'online' || (state.rematch.host && state.rematch.guest)) {
         state.game++;
         startGame(state.white === 'host' ? 'guest' : 'host'); // swap colors
         return;
@@ -291,6 +356,128 @@ function actOn(who, msg) {
   }
   broadcast();
 }
+
+function endGame(result) {
+  if (state.clock?.since) {
+    const t = chessFrom(state.moves).turn();
+    state.clock[t] = Math.max(0, state.clock[t] - (Date.now() - state.clock.since));
+    state.clock.since = null;
+  }
+  state.result = result;
+  state.phase = 'over';
+}
+
+// Can `col` still deliver mate? (Used for "timeout vs insufficient material".)
+function canMate(col, c) {
+  const pieces = c.board().flat().filter(p => p && p.color === col && p.type !== 'k');
+  if (pieces.length === 0) return false;
+  if (pieces.length === 1 && (pieces[0].type === 'n' || pieces[0].type === 'b')) return false;
+  return true;
+}
+
+function flag(color) {
+  if (state.phase !== 'playing') return;
+  state.clock[color] = 0;
+  state.clock.since = null;
+  const c = chessFrom(state.moves);
+  const result = canMate(other(color), c)
+    ? { winner: other(color), reason: 'time' }
+    : { winner: null, reason: 'timeout vs insufficient material' };
+  state.result = result;
+  state.phase = 'over';
+  broadcast();
+}
+
+/* ---------- computer opponent ---------- */
+const botColor = () => (state.white === 'guest' ? 'w' : 'b');
+
+async function maybeBotMove() {
+  if (!state || state.mode !== 'bot' || role !== 'host' || state.phase !== 'playing' || botThinking) return;
+  const c = chessFrom(state.moves);
+  if (c.turn() !== botColor()) return;
+  botThinking = true;
+  const n = state.moves.length, game = state.game;
+  try {
+    const rem = clockRemaining(botColor());
+    const movetime = rem == null ? 900 : Math.max(120, Math.min(1500, rem / 40));
+    const t0 = Date.now();
+    const mv = await botMove(c.fen(), state.guest.rating, movetime);
+    const humanPause = Math.min(300 + Math.random() * 600, rem == null ? 1e9 : rem / 60);
+    const wait = humanPause - (Date.now() - t0);
+    if (wait > 0) await sleep(wait);
+    if (state.game === game && state.moves.length === n && state.phase === 'playing') {
+      botThinking = false;
+      actOn('guest', { t: 'move', move: mv, n });
+      return;
+    }
+  } catch (err) {
+    console.error('computer move failed', err);
+  } finally {
+    botThinking = false;
+  }
+}
+
+async function botConsiderDraw() {
+  const game = state.game, n = state.moves.length;
+  let accept = false;
+  try {
+    const c = chessFrom(state.moves);
+    const ev = await quickEval(c.fen(), 10);              // side to move's view
+    const botEval = c.turn() === botColor() ? ev : -ev;
+    accept = botEval < -120 || (Math.abs(botEval) < 25 && state.moves.length > 80);
+  } catch { /* decline */ }
+  await sleep(700);
+  if (state.game !== game || state.phase !== 'playing' || !state.drawOffer) return;
+  if (accept) {
+    state.drawOffer = null;
+    endGame({ winner: null, reason: 'agreement' });
+  } else {
+    state.drawOffer = null;
+    uiNote = 'The computer declined your draw offer.';
+    setTimeout(() => { uiNote = null; render(); }, 4000);
+  }
+  if (state.moves.length >= n) broadcast();
+}
+
+/* ---------- clocks ---------- */
+const hostNow = () => (role === 'guest' ? Date.now() + clockOffset : Date.now());
+function clockRemaining(color) {
+  const c = state?.clock;
+  if (!c) return null;
+  let r = c[color];
+  if (c.since && state.phase === 'playing' && liveTurn === color) r -= hostNow() - c.since;
+  return Math.max(0, r);
+}
+function fmtClock(ms) {
+  if (ms >= 3600000) {
+    const h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60, sec = Math.floor(ms / 1000) % 60;
+    return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+  }
+  if (ms < 10000) return `0:${String(Math.floor(ms / 1000)).padStart(2, '0')}.${Math.floor(ms / 100) % 10}`;
+  const m = Math.floor(ms / 60000), sec = Math.floor(ms / 1000) % 60;
+  return `${m}:${String(sec).padStart(2, '0')}`;
+}
+function updateClocks() {
+  if (!state) return;
+  for (const el of document.querySelectorAll('.clock[data-color]')) {
+    const col = el.dataset.color;
+    const ms = clockRemaining(col);
+    if (ms == null) { el.hidden = true; continue; }
+    el.hidden = false;
+    el.textContent = fmtClock(ms);
+    el.classList.toggle('running', state.phase === 'playing' && !!state.clock.since && liveTurn === col);
+    el.classList.toggle('low', ms < 20000 && state.phase === 'playing');
+  }
+}
+setInterval(() => {
+  if (!state) return;
+  updateClocks();
+  // the host (or the single device in offline modes) decides when a flag falls
+  if (role === 'host' && state.phase === 'playing' && state.clock?.since) {
+    const t = chessFrom(state.moves).turn();
+    if (state.clock[t] - (Date.now() - state.clock.since) <= 0) flag(t);
+  }
+}, 100);
 
 /* ------------------------------------------------------------------ */
 /* Guest                                                               */
@@ -354,6 +541,7 @@ function connectToHost() {
       $('join-sub').textContent = 'Two players are already in this game. Ask your friend for a new link.';
       $('join-form').hidden = true;
     } else if (msg.t === 'state') {
+      if (msg.now) clockOffset = msg.now - Date.now();
       if (!state || msg.state.v >= state.v || msg.state.game !== state.game) state = msg.state;
       if (state.host) setConn(`Connected to ${state.host.name}`, 'on');
       render();
@@ -372,6 +560,7 @@ function showJoinForm(inv) {
   $('join-sub').textContent = inv.turns > 0
     ? `The engine plays the first ${inv.turns} moves (${styleLabel(inv.style ?? 25).toLowerCase()} opening style), tilted toward the lower-rated player. Then it’s your game.`
     : 'A normal game from the starting position.';
+  if (inv.tc) $('join-sub').textContent += ` Time control: ${tcLabel(inv.tc)}.`;
   const f = $('join-form');
   f.hidden = false;
   if (profile.name) f.name.value = profile.name;
@@ -389,12 +578,18 @@ function showJoinForm(inv) {
 /* ------------------------------------------------------------------ */
 /* Player actions (both roles)                                         */
 /* ------------------------------------------------------------------ */
+const whoOf = col => (col === 'w' ? state.white : (state.white === 'host' ? 'guest' : 'host'));
+
 function act(msg) {
-  if (role === 'host') actOn('host', msg);
+  if (role === 'host') actOn(state.mode === 'local' ? whoOf(chessFrom(state.moves).turn()) : 'host', msg);
   else if (conn && conn.open) conn.send(msg);
 }
 
-function myColor() { return state && state.white ? (state.white === role ? 'w' : 'b') : 'w'; }
+function myColor() {
+  if (!state || !state.white) return 'w';
+  if (state.mode === 'local') return chessFrom(state.moves).turn();   // whoever is to move
+  return state.white === role ? 'w' : 'b';
+}
 
 function playMove(from, to, promotion) {
   const n = state.moves.length;
@@ -479,8 +674,11 @@ function render() {
   const live = chessFrom(state.moves);
   if (viewPly != null && (viewPly >= state.moves.length || state.phase === 'simulating')) viewPly = null;
   const c = viewPly == null ? live : chessFrom(state.moves.slice(0, viewPly));
+  liveTurn = live.turn();
   const mine = myColor();
-  const orientation = flipped ? other(mine) : mine;
+  let base = mine;
+  if (state.mode === 'local') base = state.autoFlip ? live.turn() : (state.white === 'host' ? 'w' : 'b');
+  const orientation = flipped ? other(base) : base;
   const canMove = viewPly == null && state.phase === 'playing' && live.turn() === mine;
   const hist = c.history({ verbose: true });
   const last = hist[hist.length - 1];
@@ -519,6 +717,7 @@ function render() {
   renderReview();
   renderActions(mine);
   renderOverlay(mine);
+  updateClocks();
 }
 
 function playerOf(color) {
@@ -560,7 +759,7 @@ function renderPlayers(c, orientation, live) {
     av.textContent = color === 'w' ? '♔' : '♚';
     const nm = document.createElement('div');
     nm.className = 'name';
-    nm.textContent = p.name + (p.role === role ? ' (you)' : '');
+    nm.textContent = p.name + (state.mode !== 'local' && p.role === role ? ' (you)' : '') + (p.bot ? ' 🤖' : '');
     const rt = document.createElement('span');
     rt.className = 'rating';
     rt.textContent = `(${p.rating})`;
@@ -582,7 +781,11 @@ function renderPlayers(c, orientation, live) {
     nm.appendChild(caps);
     const dot = document.createElement('div');
     dot.className = 'turn-dot';
-    el.append(av, nm, dot);
+    const clk = document.createElement('div');
+    clk.className = 'clock';
+    clk.dataset.color = color;
+    clk.hidden = true;
+    el.append(av, nm, dot, clk);
     el.classList.toggle('to-move', state.phase === 'playing' && live.turn() === color);
   };
   fill($('player-top'), other(orientation));
@@ -600,7 +803,10 @@ function renderStatus(c, mine) {
     el.appendChild(s);
   } else if (state.phase === 'playing') {
     const opp = playerOf(other(mine)).name;
-    el.textContent = c.turn() === mine ? (c.inCheck() ? 'Your move — you’re in check!' : 'Your move') : `Waiting for ${opp}…`;
+    const check = c.inCheck() ? ' — check!' : '';
+    if (state.mode === 'local') el.textContent = `${playerOf(c.turn()).name} to move (${colorName(c.turn())})${check}`;
+    else if (state.mode === 'bot' && c.turn() !== mine) el.textContent = 'The computer is thinking…';
+    else el.textContent = c.turn() === mine ? (c.inCheck() ? 'Your move — you’re in check!' : 'Your move') : `Waiting for ${opp}…`;
   } else if (state.phase === 'over') {
     el.textContent = resultText(mine);
   }
@@ -608,7 +814,8 @@ function renderStatus(c, mine) {
     const d = material(c).diff;
     const line = document.createElement('div');
     line.className = 'material-line';
-    line.textContent = d === 0 ? 'Material: even' : `Material: ${playerOf(d > 0 ? 'w' : 'b').name} +${Math.abs(d)}`;
+    line.textContent = (d === 0 ? 'Material: even' : `Material: ${playerOf(d > 0 ? 'w' : 'b').name} +${Math.abs(d)}`)
+      + (state.tc ? ` · ⏱ ${tcLabel(state.tc)}` : '');
     line.title = 'Pawn = 1, knight/bishop = 3, rook = 5, queen = 9';
     el.appendChild(line);
   }
@@ -618,7 +825,8 @@ function resultText(mine) {
   const r = state.result;
   if (!r) return '';
   if (!r.winner) return `Draw — ${r.reason}`;
-  return (r.winner === mine ? 'You won' : `${playerOf(r.winner).name} won`) + ` — ${r.reason}`;
+  const who = state.mode !== 'local' && r.winner === mine ? 'You won' : `${playerOf(r.winner).name} won`;
+  return `${who} — ${r.reason === 'time' ? 'on time' : r.reason}`;
 }
 
 function renderHandicap() {
@@ -775,14 +983,17 @@ function renderLearn() {
 function renderActions(mine) {
   const playing = state.phase === 'playing';
   $('btn-draw').disabled = !playing || !!state.drawOffer;
+  $('btn-draw').textContent = state.mode === 'local' ? '½ Agree draw' : '½ Offer draw';
   $('btn-resign').disabled = !playing;
+  if (!$('btn-resign').dataset.armed) $('btn-resign').textContent = state.mode === 'local' && playing ? `⚑ ${colorName(liveTurn)} resigns` : '⚑ Resign';
   const n = $('notice');
   n.innerHTML = '';
   n.hidden = true;
+  if (uiNote) { n.hidden = false; n.textContent = uiNote; }
   if (playing && state.drawOffer) {
     n.hidden = false;
     if (state.drawOffer === mine) {
-      n.textContent = 'Draw offered. Waiting for a reply…';
+      n.textContent = state.mode === 'bot' ? 'Draw offered. The computer is thinking about it…' : 'Draw offered. Waiting for a reply…';
     } else {
       const t = document.createElement('div');
       t.textContent = `${playerOf(state.drawOffer).name} offers a draw.`;
@@ -815,17 +1026,20 @@ function renderOverlay(mine) {
   box.className = 'box';
   const h = document.createElement('h3');
   const r = state.result;
-  h.textContent = !r?.winner ? 'Draw' : r.winner === mine ? 'You won!' : `${playerOf(r.winner).name} won`;
+  h.textContent = !r?.winner ? 'Draw'
+    : state.mode !== 'local' && r.winner === mine ? 'You won!' : `${playerOf(r.winner).name} won`;
   const p = document.createElement('p');
-  p.textContent = r ? (r.winner ? `by ${r.reason}` : `by ${r.reason}`) : '';
+  p.textContent = r ? (r.reason === 'time' ? 'on time' : `by ${r.reason}`) : '';
   const meReq = state.rematch[role];
   const themReq = state.rematch[role === 'host' ? 'guest' : 'host'];
-  const rb = btn(meReq ? 'Waiting for friend…' : themReq ? 'Accept rematch' : 'Rematch (swap colors)', 'primary', () => act({ t: 'rematch' }));
-  rb.disabled = meReq;
+  const online = state.mode === 'online';
+  const rb = btn(online ? (meReq ? 'Waiting for friend…' : themReq ? 'Accept rematch' : 'Rematch (swap colors)') : 'Play again (swap colors)', 'primary', () => act({ t: 'rematch' }));
+  rb.disabled = online && meReq;
   const info = document.createElement('p');
-  info.textContent = themReq && !meReq ? 'Your friend wants a rematch!' : '';
+  info.textContent = online && themReq && !meReq ? 'Your friend wants a rematch!' : '';
   const close = btn('View board', 'ghost', () => { ov.dataset.dismissed = `${state.game}`; ov.hidden = true; });
-  box.append(h, p, info, rb, close);
+  const fresh = btn('New game', 'ghost', () => { location.href = location.pathname + (SIGNAL ? `?signal=${SIGNAL}` : ''); });
+  box.append(h, p, info, rb, close, fresh);
   ov.appendChild(box);
 }
 
@@ -870,9 +1084,15 @@ if (!gameId) {
   if (hosted) {
     role = 'host';
     state = hosted;
+    state.mode = state.mode || 'online';
     render();
     if (state.phase === 'simulating' || !state.guest) getEngine();
-    startHost();
+    if (state.mode === 'online') startHost();
+    else {
+      setConn(state.mode === 'bot' ? 'Offline · vs computer' : 'Offline · same device', 'on');
+      if (state.phase === 'simulating') runSimulation();
+      maybeBotMove();
+    }
   } else {
     startGuest();
   }

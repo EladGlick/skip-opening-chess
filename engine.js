@@ -62,6 +62,56 @@ export function getEngine() {
   return engine;
 }
 
+// A second engine instance plays as the computer opponent (its strength settings
+// must not leak into the opening simulator).
+let botEngine = null;
+export function getBotEngine() {
+  if (!botEngine) botEngine = new Stockfish();
+  return botEngine;
+}
+
+/**
+ * Choose a move for the computer opponent.
+ * @param {string} fen
+ * @param {number} elo  400 … 2800
+ * @param {number} movetime  ms to think (strong levels)
+ * @returns {Promise<{from:string,to:string,promotion?:string}>}
+ */
+export async function botMove(fen, elo, movetime = 800) {
+  const sf = getBotEngine();
+  await sf.ready;
+  let uci;
+  if (elo >= 1400) {
+    // Stockfish's own strength limiter (valid from ~1320 Elo).
+    sf.send('setoption name MultiPV value 1');
+    sf.send('setoption name UCI_LimitStrength value true');
+    sf.send(`setoption name UCI_Elo value ${Math.min(3190, Math.round(elo))}`);
+    sf.send(`position fen ${fen}`);
+    await sf.isReady();
+    const lines = await sf.cmd(`go movetime ${movetime}`, l => l.startsWith('bestmove'));
+    uci = lines[lines.length - 1].split(' ')[1];
+  } else {
+    // Weaker levels: look at several candidate moves and pick one at random,
+    // with more randomness (bigger mistakes) the lower the rating.
+    sf.send('setoption name UCI_LimitStrength value false');
+    const depth = elo < 800 ? 4 : 7;
+    const scored = await sf.analyse(fen, { multipv: 8, depth });
+    const temp = Math.max(25, (1450 - elo) / 3.2);      // cp
+    const best = scored[0].score;
+    const weights = scored.map(s => Math.exp((s.score - best) / temp));
+    uci = weightedPick(scored, weights).uci;
+  }
+  return { from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] };
+}
+
+/** Engine evaluation (centipawns, side to move's point of view). */
+export async function quickEval(fen, depth = 11) {
+  const sf = getBotEngine();
+  sf.send('setoption name UCI_LimitStrength value false');
+  const [top] = await sf.analyse(fen, { multipv: 1, depth });
+  return top ? top.score : 0;
+}
+
 // How big an edge (centipawns) the lower-rated player gets out of the opening.
 // ~1 pawn per 200 rating points, capped at 4 pawns. Gaps under 50 → fair opening.
 export function targetAdvantage(gap) {
