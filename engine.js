@@ -2,6 +2,7 @@
 // Uses Stockfish (WASM, runs in a Web Worker in the browser) to score every legal
 // move, then picks moves so the lower-rated player comes out of the opening ahead.
 import { Chess } from './vendor/chess.js';
+import { loadOpenings, bookCount } from './openings.js';
 
 const ENGINE_URL = new URL('./vendor/stockfish/stockfish-18-lite-single.js', import.meta.url);
 const MATE = 10000;
@@ -70,18 +71,30 @@ export function targetAdvantage(gap) {
 }
 
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+function weightedPick(items, weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < items.length; i++) { r -= weights[i]; if (r <= 0) return items[i]; }
+  return items[items.length - 1];
+}
 
 /**
  * Simulate the first `turns` full moves.
+ * @param {object} o
+ * @param {number} o.style   0 = classic book openings … 100 = crazy, unusual openings
+ * @param {string[]} [o.avoid]  recent openings (space-joined SAN prefixes) not to repeat
  * @returns {Promise<{moves:string[], fen:string, evalWhite:number, target:number, favored:'w'|'b'|null}>}
  */
-export async function simulateOpening({ whiteRating, blackRating, turns, onMove }) {
+export async function simulateOpening({ whiteRating, blackRating, turns, style = 30, avoid = [], onMove }) {
   const sf = getEngine();
+  await loadOpenings();
   const chess = new Chess();
   const gap = whiteRating - blackRating;          // > 0 → White is stronger
   const target = targetAdvantage(gap);
   const favored = target === 0 ? null : (gap > 0 ? 'b' : 'w');
   const totalPlies = turns * 2;
+  const s = Math.max(0, Math.min(100, style)) / 100;
+  const avoidSet = new Set(avoid);
   const sans = [];
 
   for (let ply = 0; ply < totalPlies; ply++) {
@@ -91,29 +104,57 @@ export async function simulateOpening({ whiteRating, blackRating, turns, onMove 
     const scored = await sf.analyse(chess.fen(), { multipv: Math.min(legal, 40), depth: 10 });
     const best = scored[0].score;
     // Never walk into a forced mate during the simulation.
-    const pool = scored.filter(s => s.score > -MATE + 100);
-    const options = pool.length ? pool : scored;
-    let choice;
+    const safe = scored.filter(m => m.score > -MATE + 100);
+    const options = safe.length ? safe : scored;
 
-    if (!favored || side === favored) {
-      // Play well, with some variety (wider in the first couple of moves).
-      const window = ply < 4 ? 35 : 15;
-      choice = pick(options.filter(s => best - s.score <= window));
-    } else {
-      // Concede a little each move so the favored side's edge drifts toward the target.
-      // The very first moves stay natural when there is room to concede later.
-      const natural = ply < 4 && totalPlies >= 8;
-      if (natural) {
-        choice = pick(options.filter(s => best - s.score <= 25));
-      } else {
-        const favoredEval = -best;
-        const remaining = Math.max(1, Math.ceil((totalPlies - ply) / 2));
-        const wantLoss = Math.min(150, Math.max(0, (target - favoredEval) / remaining));
-        let bestFit = Infinity;
-        for (const s of options) bestFit = Math.min(bestFit, Math.abs(best - s.score - wantLoss));
-        choice = pick(options.filter(s => Math.abs(best - s.score - wantLoss) <= bestFit + 12));
-      }
+    // How much may this side give away (in cp) to land on the handicap target?
+    const sideTarget = !favored ? 0 : side === favored ? target : -target;
+    const remaining = Math.max(1, Math.ceil((totalPlies - ply) / 2));
+    const nearEnd = remaining <= 1;
+    const natural = ply < 4 && totalPlies >= 8;          // first moves: no handicap concessions
+    const budget = natural ? 0 : Math.max(0, best - sideTarget);
+    const desired = Math.min(180, budget / remaining);
+
+    // Style: a "free" variety allowance on top of the handicap; shrinks to 0 on the last move.
+    // A side that is behind its handicap target plays the crazy stuff more carefully.
+    const ahead = Math.max(0.25, Math.min(1, 1 + (best - sideTarget) / 200));
+    const center = desired + (nearEnd ? 0 : s * s * 55 * ahead);
+    const sigma = nearEnd ? 12 : 12 + Math.pow(s, 1.5) * 45;
+    const maxLoss = Math.min(220, center + 2 * sigma + 10);
+
+    const cands = [];
+    for (const m of options) {
+      const loss = best - m.score;
+      if (loss > maxLoss) continue;
+      const u = m.uci;
+      const mv = chess.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] });
+      const count = bookCount([...sans, mv.san]);
+      chess.undo();
+      const kingWalk = mv.piece === 'k' && !mv.flags.includes('k') && !mv.flags.includes('q');
+      cands.push({ ...m, san: mv.san, loss, book: count > 0, pop: Math.log2(1 + count), kingWalk, earlyQueen: mv.piece === 'q' && ply < 12 && !mv.captured });
     }
+    if (!cands.length) cands.push({ ...options[0], loss: 0, book: false, pop: 0, kingWalk: false, san: null });
+
+    // Classic games stick to known theory when possible.
+    let pool = cands;
+    if (s < 0.25) {
+      const bookOnes = cands.filter(c => c.book && c.loss <= center + sigma + 10);
+      if (bookOnes.length) pool = bookOnes;
+    }
+    // Don't recreate the start of a recent game.
+    if (ply === 3 || ply === 7) {
+      const fresh = pool.filter(c => !avoidSet.has([...sans, c.san].join(' ')));
+      if (fresh.length) pool = fresh;
+    }
+    const weights = pool.map(c => {
+      let w = Math.exp(-((c.loss - center) ** 2) / (2 * sigma * sigma)) + 1e-6;
+      if (s < 0.6) w *= Math.exp(c.pop * (0.6 - s) * 1.2);    // classic: favour popular theory
+      else w *= 1 + (s - 0.6) * 12 / (1 + c.pop);             // crazy: favour rare / unknown moves
+      if (c.kingWalk && s < 0.9) w *= 0.1;                    // king walks look silly
+      if (c.earlyQueen && s < 0.5) w *= 0.3;                  // so do early queen trips
+      return w;
+    });
+    const choice = weightedPick(pool, weights);
 
     const u = choice.uci;
     const mv = chess.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] });

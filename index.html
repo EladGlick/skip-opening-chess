@@ -32,6 +32,10 @@
         <label>Moves to simulate <output id="turns-out">8</output>
           <input name="turns" type="range" min="0" max="20" value="8">
         </label>
+        <label>Opening style <output id="style-out">Mainstream</output>
+          <input name="style" type="range" min="0" max="100" value="25">
+          <span class="range-ends"><span>Classic</span><span>Crazy</span></span>
+        </label>
         <fieldset class="seg">
           <legend>Your color</legend>
           <label><input type="radio" name="color" value="w"><span>White</span></label>
@@ -74,6 +78,7 @@
         <div class="player top-player" id="player-top"></div>
         <div class="board-wrap">
           <div id="board" class="cg-wrap"></div>
+          <button class="viewing" id="viewing" type="button" hidden></button>
           <div class="overlay" id="overlay" hidden></div>
           <div class="promo" id="promo" hidden></div>
         </div>
@@ -82,7 +87,17 @@
       <aside class="side">
         <div class="status" id="status"></div>
         <div class="handicap" id="handicap" hidden></div>
+        <details class="learn" id="learn" hidden>
+          <summary><span class="learn-title">📖 Learn this opening</span><span class="learn-name" id="learn-name"></span></summary>
+          <div class="learn-body" id="learn-body"></div>
+        </details>
         <ol class="moves" id="moves"></ol>
+        <div class="review" id="review">
+          <button class="btn ghost icon" id="nav-first" type="button" title="First move" aria-label="First move">⏮</button>
+          <button class="btn ghost icon" id="nav-prev" type="button" title="Previous move" aria-label="Previous move">◀</button>
+          <button class="btn ghost icon" id="nav-next" type="button" title="Next move" aria-label="Next move">▶</button>
+          <button class="btn ghost icon" id="nav-last" type="button" title="Back to the game" aria-label="Back to the game">⏭</button>
+        </div>
         <div class="actions" id="actions">
           <button class="btn" id="btn-draw" type="button">½ Offer draw</button>
           <button class="btn" id="btn-resign" type="button">⚑ Resign</button>
@@ -93,7 +108,7 @@
     </section>
   </main>
 
-  <footer class="foot">Opening engine: Stockfish (GPLv3) · Board: chessground (GPLv3)</footer>
+  <footer class="foot">Opening engine: Stockfish (GPLv3) · Board: chessground (GPLv3) · Opening names: Lichess chess-openings (CC0)</footer>
 
   <script src="vendor/peerjs.min.js"></script>
   <script type="module" src="app.js"></script>

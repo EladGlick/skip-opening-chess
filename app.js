@@ -1,6 +1,7 @@
 import { Chess } from './vendor/chess.js';
 import { Chessground } from './vendor/chessground/chessground.min.js';
 import { simulateOpening, getEngine, targetAdvantage } from './engine.js';
+import { loadOpenings, identify, describe, styleLabel, lichessOpeningUrl, lichessAnalysisUrl, wikipediaUrl } from './openings.js';
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -59,6 +60,8 @@ let flipped = false;
 let cg = null;
 let simulating = false;
 let lastRenderedKey = '';
+let viewPly = null;        // null = live position; otherwise number of plies shown while reviewing
+let autoplay = null;
 
 const profile = store.get('profile') || {};
 
@@ -86,16 +89,20 @@ function initCreate() {
   const out = $('turns-out');
   const sync = () => { out.textContent = f.turns.value === '0' ? '0 (normal game)' : f.turns.value; };
   f.turns.addEventListener('input', sync); sync();
+  if (profile.style != null) f.style.value = profile.style;
+  const syncStyle = () => { $('style-out').textContent = styleLabel(+f.style.value); };
+  f.style.addEventListener('input', syncStyle); syncStyle();
   f.addEventListener('submit', e => {
     e.preventDefault();
     const name = f.name.value.trim() || 'Host';
     const rating = Math.round(+f.rating.value) || 1200;
-    store.set('profile', { name, rating });
+    store.set('profile', { ...profile, name, rating, style: +f.style.value });
     gameId = randId();
     state = {
       id: gameId, v: 0, game: 1,
       phase: 'lobby',
       turns: +f.turns.value,
+      style: +f.style.value,
       colorPref: f.color.value,
       host: { name, rating },
       guest: null,
@@ -164,7 +171,7 @@ function hostHandle(c, msg) {
         setConn(`Connected to ${state.guest.name}`, 'on');
         c.send({ t: 'state', state });
       } else if (!state.guest) {
-        c.send({ t: 'invite', host: state.host, turns: state.turns });
+        c.send({ t: 'invite', host: state.host, turns: state.turns, style: state.style ?? 25 });
       } else {
         c.send({ t: 'full' });
       }
@@ -192,6 +199,7 @@ function pickWhite() {
 }
 
 function startGame(white) {
+  viewPly = null; stopAutoplay();
   Object.assign(state, {
     white, phase: 'simulating', moves: [], simCount: 0, sim: null,
     result: null, drawOffer: null, rematch: { host: false, guest: false },
@@ -209,11 +217,14 @@ async function runSimulation() {
   const blackRating = state.white === 'host' ? state.guest.rating : state.host.rating;
   try {
     if (state.turns > 0) {
+      const recent = store.get('recentStarts') || [];
       const res = await simulateOpening({
-        whiteRating, blackRating, turns: state.turns,
+        whiteRating, blackRating, turns: state.turns, style: state.style ?? 25, avoid: recent,
         onMove: ({ san }) => { state.moves.push(san); broadcast(); },
       });
       state.sim = { evalWhite: res.evalWhite, target: res.target, favored: res.favored };
+      const starts = [res.moves.slice(0, 4).join(' '), res.moves.slice(0, 8).join(' ')];
+      store.set('recentStarts', [...starts, ...recent].slice(0, 40));
     } else {
       state.sim = { evalWhite: 0, target: 0, favored: null };
     }
@@ -359,7 +370,7 @@ function showJoinForm(inv) {
   show('screen-join');
   $('join-title').textContent = `${inv.host.name} (${inv.host.rating}) invited you`;
   $('join-sub').textContent = inv.turns > 0
-    ? `The first ${inv.turns} moves will be played by the engine, tilted toward the lower-rated player. Then it’s your game.`
+    ? `The engine plays the first ${inv.turns} moves (${styleLabel(inv.style ?? 25).toLowerCase()} opening style), tilted toward the lower-rated player. Then it’s your game.`
     : 'A normal game from the starting position.';
   const f = $('join-form');
   f.hidden = false;
@@ -369,7 +380,7 @@ function showJoinForm(inv) {
     e.preventDefault();
     const name = f.name.value.trim() || 'Friend';
     const rating = Math.round(+f.rating.value) || 1200;
-    store.set('profile', { name, rating });
+    store.set('profile', { ...profile, name, rating });
     f.querySelector('button').disabled = true;
     conn.send({ t: 'join', name, rating, token: guestToken });
   };
@@ -465,14 +476,16 @@ function render() {
   show('screen-game');
   ensureBoard();
 
-  const c = chessFrom(state.moves);
+  const live = chessFrom(state.moves);
+  if (viewPly != null && (viewPly >= state.moves.length || state.phase === 'simulating')) viewPly = null;
+  const c = viewPly == null ? live : chessFrom(state.moves.slice(0, viewPly));
   const mine = myColor();
   const orientation = flipped ? other(mine) : mine;
-  const canMove = state.phase === 'playing' && c.turn() === mine;
+  const canMove = viewPly == null && state.phase === 'playing' && live.turn() === mine;
   const hist = c.history({ verbose: true });
   const last = hist[hist.length - 1];
 
-  const key = `${state.game}|${state.moves.length}|${state.phase}|${orientation}`;
+  const key = `${state.game}|${state.moves.length}|${state.phase}|${orientation}|${viewPly}`;
   if (key !== lastRenderedKey) {
     lastRenderedKey = key;
     const dests = new Map();
@@ -490,11 +503,20 @@ function render() {
       movable: { color: canMove ? (mine === 'w' ? 'white' : 'black') : undefined, dests },
     });
   }
+  const vb = $('viewing');
+  vb.hidden = viewPly == null;
+  if (viewPly != null) {
+    const n = Math.ceil(viewPly / 2);
+    const at = viewPly === 0 ? 'the start position' : `${n}${viewPly % 2 ? '.' : '…'} ${state.moves[viewPly - 1]}`;
+    vb.textContent = `Viewing ${at} · tap to return to the game`;
+  }
 
-  renderPlayers(c, orientation);
-  renderStatus(c, mine);
+  renderPlayers(c, orientation, live);
+  renderStatus(live, mine);
   renderHandicap();
+  renderLearn();
   renderMoves();
+  renderReview();
   renderActions(mine);
   renderOverlay(mine);
 }
@@ -504,7 +526,32 @@ function playerOf(color) {
   return { ...state[r], role: r };
 }
 
-function renderPlayers(c, orientation) {
+const VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+const START = { p: 8, n: 2, b: 2, r: 2, q: 1 };
+const GLYPH = { w: { p: '♙', n: '♘', b: '♗', r: '♖', q: '♕' }, b: { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛' } };
+
+// Material on the board: points per side, and which enemy pieces each side has captured.
+function material(c) {
+  const pts = { w: 0, b: 0 };
+  const have = { w: { p: 0, n: 0, b: 0, r: 0, q: 0 }, b: { p: 0, n: 0, b: 0, r: 0, q: 0 } };
+  for (const row of c.board()) for (const sq of row) {
+    if (!sq || sq.type === 'k') continue;
+    pts[sq.color] += VALUE[sq.type];
+    have[sq.color][sq.type]++;
+  }
+  const captured = { w: [], b: [] }; // captured[w] = black pieces White has taken
+  for (const col of ['w', 'b']) {
+    const opp = other(col);
+    for (const t of ['q', 'r', 'b', 'n', 'p']) {
+      const missing = Math.max(0, START[t] - have[opp][t]);
+      for (let i = 0; i < missing; i++) captured[col].push(GLYPH[opp][t]);
+    }
+  }
+  return { diff: pts.w - pts.b, captured };
+}
+
+function renderPlayers(c, orientation, live) {
+  const mat = material(c);
   const fill = (el, color) => {
     const p = playerOf(color);
     el.innerHTML = '';
@@ -518,10 +565,25 @@ function renderPlayers(c, orientation) {
     rt.className = 'rating';
     rt.textContent = `(${p.rating})`;
     nm.appendChild(rt);
+    const caps = document.createElement('div');
+    caps.className = 'caps';
+    const g = document.createElement('span');
+    g.className = 'cap-glyphs';
+    g.textContent = mat.captured[color].join('');
+    caps.appendChild(g);
+    const lead = color === 'w' ? mat.diff : -mat.diff;
+    if (lead > 0) {
+      const sc = document.createElement('span');
+      sc.className = 'score';
+      sc.textContent = `+${lead}`;
+      sc.title = `${lead} point${lead > 1 ? 's' : ''} of material ahead (pawn 1, knight/bishop 3, rook 5, queen 9)`;
+      caps.appendChild(sc);
+    }
+    nm.appendChild(caps);
     const dot = document.createElement('div');
     dot.className = 'turn-dot';
     el.append(av, nm, dot);
-    el.classList.toggle('to-move', state.phase === 'playing' && c.turn() === color);
+    el.classList.toggle('to-move', state.phase === 'playing' && live.turn() === color);
   };
   fill($('player-top'), other(orientation));
   fill($('player-bottom'), orientation);
@@ -541,6 +603,14 @@ function renderStatus(c, mine) {
     el.textContent = c.turn() === mine ? (c.inCheck() ? 'Your move — you’re in check!' : 'Your move') : `Waiting for ${opp}…`;
   } else if (state.phase === 'over') {
     el.textContent = resultText(mine);
+  }
+  if (state.phase !== 'simulating' || state.moves.length) {
+    const d = material(c).diff;
+    const line = document.createElement('div');
+    line.className = 'material-line';
+    line.textContent = d === 0 ? 'Material: even' : `Material: ${playerOf(d > 0 ? 'w' : 'b').name} +${Math.abs(d)}`;
+    line.title = 'Pawn = 1, knight/bishop = 3, rook = 5, queen = 9';
+    el.appendChild(line);
   }
 }
 
@@ -591,8 +661,13 @@ function renderMoves() {
     li.appendChild(n);
     for (const j of [i, i + 1]) {
       const m = document.createElement('span');
-      m.className = 'm' + (j < simEnd ? ' sim' : '') + (j === total - 1 ? ' last' : '');
+      const shown = viewPly == null ? total : viewPly;
+      m.className = 'm' + (j < simEnd ? ' sim' : '') + (j === shown - 1 ? ' last' : '');
       m.textContent = state.moves[j] || '';
+      if (state.moves[j] && state.phase !== 'simulating') {
+        m.classList.add('click');
+        m.onclick = () => goTo(j + 1);
+      }
       li.appendChild(m);
     }
     ol.appendChild(li);
@@ -600,13 +675,101 @@ function renderMoves() {
     if (simEnd === i + 1 && simEnd < total && state.phase !== 'simulating') ol.appendChild(divider());
   }
   if (total === simEnd && simEnd > 0 && state.phase !== 'simulating') ol.appendChild(divider());
-  ol.scrollTop = ol.scrollHeight;
+  if (viewPly == null) ol.scrollTop = ol.scrollHeight;
+  else ol.querySelector('.m.last')?.scrollIntoView({ block: 'nearest' });
   function divider() {
     const d = document.createElement('li');
     d.className = 'divider';
     d.textContent = 'Your game starts here';
     return d;
   }
+}
+
+/* ---------- reviewing moves ---------- */
+function goTo(ply) {
+  stopAutoplay();
+  if (!state || state.phase === 'simulating') return;
+  ply = Math.max(0, Math.min(state.moves.length, ply));
+  viewPly = ply >= state.moves.length ? null : ply;
+  render();
+}
+function stopAutoplay() { if (autoplay) { clearInterval(autoplay); autoplay = null; } }
+function playThroughOpening() {
+  stopAutoplay();
+  viewPly = 0;
+  render();
+  autoplay = setInterval(() => {
+    if (viewPly == null || viewPly >= state.simCount) { stopAutoplay(); render(); return; }
+    viewPly++;
+    if (viewPly >= state.moves.length) viewPly = null;
+    render();
+  }, 900);
+}
+function renderReview() {
+  const cur = viewPly == null ? state.moves.length : viewPly;
+  const off = state.phase === 'simulating' || !state.moves.length;
+  $('nav-first').disabled = off || cur === 0;
+  $('nav-prev').disabled = off || cur === 0;
+  $('nav-next').disabled = off || viewPly == null;
+  $('nav-last').disabled = off || viewPly == null;
+}
+$('nav-first').onclick = () => goTo(0);
+$('nav-prev').onclick = () => goTo((viewPly == null ? state.moves.length : viewPly) - 1);
+$('nav-next').onclick = () => goTo((viewPly ?? state.moves.length) + 1);
+$('nav-last').onclick = () => goTo(Infinity);
+$('viewing').onclick = () => goTo(Infinity);
+document.addEventListener('keydown', e => {
+  if (!state || $('screen-game').hidden || e.target.closest('input, textarea')) return;
+  if (e.key === 'ArrowLeft') { e.preventDefault(); $('nav-prev').click(); }
+  if (e.key === 'ArrowRight') { e.preventDefault(); $('nav-next').click(); }
+});
+
+/* ---------- learn about the opening ---------- */
+let learnKey = '';
+function renderLearn() {
+  const box = $('learn');
+  if (state.phase === 'simulating' || !state.simCount) { box.hidden = true; learnKey = ''; return; }
+  const simMoves = state.moves.slice(0, state.simCount);
+  const key = state.game + '|' + simMoves.join(' ');
+  if (key === learnKey) return;
+  const info = identify(simMoves);
+  if (!info) { loadOpenings().then(() => render()); return; }
+  learnKey = key;
+  if (box.hidden) box.open = window.innerWidth > 820;
+  box.hidden = false;
+  $('learn-name').textContent = info.name;
+  const body = $('learn-body');
+  body.innerHTML = '';
+  const add = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; body.appendChild(e); return e; };
+
+  const head = add('div', 'learn-head');
+  const eco = document.createElement('span'); eco.className = 'eco'; eco.textContent = info.eco;
+  const nm = document.createElement('b'); nm.textContent = info.name;
+  const st = document.createElement('span'); st.className = 'chip'; st.textContent = `${styleLabel(state.style ?? 25)} style`;
+  head.append(eco, nm, st);
+
+  add('p', null, describe(info, state.style ?? 25));
+
+  const pgn = simMoves.map((m, i) => (i % 2 === 0 ? `${i / 2 + 1}. ` : '') + m).join(' ');
+  add('p', 'pgn', pgn);
+
+  let theory;
+  const bp = info.bookPly;
+  if (bp === 0) theory = 'The engine left known opening theory on the very first move.';
+  else if (bp >= simMoves.length) theory = `Every simulated move is known opening theory.`;
+  else if (bp === 1) theory = 'Only the first move is known theory; after that the engine improvised.';
+  else theory = `Known theory up to ${Math.ceil(bp / 2)}${bp % 2 ? '.' : '…'} ${simMoves[bp - 1]}; after that the engine improvised.`;
+  add('p', 'muted-p', theory);
+
+  const row = add('div', 'learn-actions');
+  const replay = btn('▶ Replay on the board', 'primary small', () => playThroughOpening());
+  row.appendChild(replay);
+  const links = add('div', 'learn-links');
+  const link = (href, text) => { const a = document.createElement('a'); a.href = href; a.target = '_blank'; a.rel = 'noopener'; a.textContent = text; links.appendChild(a); };
+  const end = chessFrom(simMoves).fen();
+  if (info.family) link(lichessOpeningUrl(info.name), 'Opening on Lichess ↗');
+  link(lichessAnalysisUrl(end), 'Analyze this position ↗');
+  if (info.family) link(wikipediaUrl(info.family), 'Read on Wikipedia ↗');
 }
 
 function renderActions(mine) {
@@ -699,6 +862,7 @@ $('btn-flip').onclick = () => { flipped = !flipped; render(); };
 /* ------------------------------------------------------------------ */
 /* Boot                                                                */
 /* ------------------------------------------------------------------ */
+loadOpenings().then(() => { if (state) render(); });
 if (!gameId) {
   initCreate();
 } else {
