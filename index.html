@@ -168,6 +168,29 @@
         </fieldset>
 
         <fieldset class="group">
+          <legend>Help during the game <output class="pill" id="help-out">3 hints · 1 takeback</output></legend>
+          <div class="custom-tc help-row">
+            <div class="stepper">
+              <span class="field-label">💡 Best-move hints</span>
+              <div class="stepper-box">
+                <button type="button" class="step" data-step="hints" data-delta="-1" aria-label="Fewer hints">−</button>
+                <input name="hints" type="number" inputmode="numeric" min="0" max="10" step="1" value="3">
+                <button type="button" class="step" data-step="hints" data-delta="1" aria-label="More hints">+</button>
+              </div>
+            </div>
+            <div class="stepper">
+              <span class="field-label">↶ Takebacks</span>
+              <div class="stepper-box">
+                <button type="button" class="step" data-step="takebacks" data-delta="-1" aria-label="Fewer takebacks">−</button>
+                <input name="takebacks" type="number" inputmode="numeric" min="0" max="5" step="1" value="1">
+                <button type="button" class="step" data-step="takebacks" data-delta="1" aria-label="More takebacks">+</button>
+              </div>
+            </div>
+          </div>
+          <p class="hint-text">Per player, per game. A hint shows the engine’s best move; a takeback undoes your last move — even after your opponent has replied.</p>
+        </fieldset>
+
+        <fieldset class="group">
           <legend data-label-local="Player 1 plays">You play</legend>
           <div class="colors">
             <label class="color-opt"><input type="radio" name="color" value="w"><span><i class="pc white" aria-hidden="true">♚</i>White</span></label>
@@ -243,6 +266,10 @@
           </div>
         </div>
         <div class="notice" id="notice" hidden></div>
+        <div class="actions help-actions" id="help-actions">
+          <button class="btn" id="btn-hint" type="button">💡 Hint</button>
+          <button class="btn" id="btn-takeback" type="button">↶ Takeback</button>
+        </div>
         <div class="actions" id="actions">
           <button class="btn" id="btn-draw" type="button">½ Offer draw</button>
           <button class="btn" id="btn-resign" type="button">⚑ Resign</button>

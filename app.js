@@ -1,6 +1,6 @@
 import { Chess } from './vendor/chess.js';
 import { Chessground } from './vendor/chessground/chessground.min.js';
-import { simulateOpening, getEngine, getBotEngine, botMove, quickEval, targetAdvantage } from './engine.js';
+import { simulateOpening, getEngine, getBotEngine, botMove, quickEval, targetAdvantage, bestMove } from './engine.js';
 import { loadOpenings, identify, describe, styleLabel, lichessOpeningUrl, lichessAnalysisUrl, wikipediaUrl } from './openings.js';
 
 /* ------------------------------------------------------------------ */
@@ -66,6 +66,8 @@ let clockOffset = 0;       // guest: host clock minus local clock
 let liveTurn = 'w';        // side to move in the live position (cached by render)
 let botThinking = false;
 let uiNote = null;         // short-lived message shown under the buttons
+let hint = null;           // { game, n, from, to, san } — the best move currently shown to this player
+let hintBusy = false;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const profile = store.get('profile') || {};
@@ -142,10 +144,21 @@ function initCreate() {
       const step = inp.name === 'tcMin' && +inp.value < 2 ? 0.5 : 1;
       const v = Math.min(+inp.max, Math.max(+inp.min, (+inp.value || 0) + step * +b.dataset.delta));
       inp.value = v;
+      inp.dispatchEvent(new Event('input'));
       syncTc();
     });
   }
   syncTc();
+
+  if (profile.hints != null) f.hints.value = profile.hints;
+  if (profile.takebacks != null) f.takebacks.value = profile.takebacks;
+  const syncHelp = () => {
+    const h = +f.hints.value || 0, t = +f.takebacks.value || 0;
+    $('help-out').textContent = !h && !t ? 'Off' : `${h} hint${h === 1 ? '' : 's'} · ${t} takeback${t === 1 ? '' : 's'}`;
+  };
+  f.hints.addEventListener('input', syncHelp);
+  f.takebacks.addEventListener('input', syncHelp);
+  syncHelp();
 
   // slider fill
   for (const r of f.querySelectorAll('.range')) {
@@ -174,8 +187,10 @@ function initCreate() {
     const name2 = f.name2.value.trim() || 'Player 2';
     const rating2 = Math.round(+f.rating2.value) || 1200;
     const botRating = +f.botRating.value;
+    const clampInt = (v, max) => Math.max(0, Math.min(max, Math.round(+v) || 0));
+    const help = { hints: clampInt(f.hints.value, 10), takebacks: clampInt(f.takebacks.value, 5) };
     store.set('profile', { ...profile, name, rating, style: +f.style.value, mode, tc: f.tc.value,
-      botRating, name2: f.name2.value.trim(), rating2 });
+      botRating, name2: f.name2.value.trim(), rating2, hints: help.hints, takebacks: help.takebacks });
     gameId = randId();
     state = {
       id: gameId, v: 0, game: 1,
@@ -185,6 +200,8 @@ function initCreate() {
       style: +f.style.value,
       tc: parseTc(f),
       clock: null,
+      help,
+      used: freshUsed(),
       autoFlip: f.autoFlip.checked,
       colorPref: f.color.value,
       host: { name, rating },
@@ -262,7 +279,7 @@ function hostHandle(c, msg) {
         setConn(`Connected to ${state.guest.name}`, 'on');
         c.send({ t: 'state', state, now: Date.now() });
       } else if (!state.guest) {
-        c.send({ t: 'invite', host: state.host, turns: state.turns, style: state.style ?? 25, tc: state.tc || null });
+        c.send({ t: 'invite', host: state.host, turns: state.turns, style: state.style ?? 25, tc: state.tc || null, help: state.help || null });
       } else {
         c.send({ t: 'full' });
       }
@@ -294,7 +311,9 @@ function startGame(white) {
   Object.assign(state, {
     white, phase: 'simulating', moves: [], simCount: 0, sim: null, clock: null,
     result: null, drawOffer: null, rematch: { host: false, guest: false },
+    used: freshUsed(), lastTakeback: null, undos: 0,
   });
+  hint = null;
   broadcast();
   runSimulation();
 }
@@ -376,6 +395,34 @@ function actOn(who, msg) {
       if (state.drawOffer !== other(color)) return;
       state.drawOffer = null;
       break;
+    case 'hint': {
+      // The player's own browser computes the move; the host only keeps count.
+      if (state.phase !== 'playing' || helpLeft(who, 'hints') <= 0) return;
+      const c = chessFrom(state.moves);
+      if (c.turn() !== color) return;
+      state.used[who].hints++;
+      break;
+    }
+    case 'takeback': {
+      if (state.phase !== 'playing') return;
+      // Same device: either player may take back their own last move.
+      const col = state.mode === 'local' && (msg.color === 'w' || msg.color === 'b') ? msg.color : color;
+      const owner = whoOf(col);
+      const plies = takebackPlies(col);
+      if (!plies || helpLeft(owner, 'takebacks') <= 0) return;
+      if (state.clock?.since) {
+        const t = chessFrom(state.moves).turn();
+        const now = Date.now();
+        state.clock[t] = Math.max(0, state.clock[t] - (now - state.clock.since));
+        state.clock.since = now;
+      }
+      state.moves.splice(state.moves.length - plies, plies);
+      state.used[owner].takebacks++;
+      state.undos = (state.undos || 0) + 1;
+      state.drawOffer = null;
+      state.lastTakeback = { color: col, n: state.moves.length, undos: state.undos };
+      break;
+    }
     case 'rematch':
       if (state.phase !== 'over') return;
       state.rematch[who] = true;
@@ -399,6 +446,22 @@ function endGame(result) {
   }
   state.result = result;
   state.phase = 'over';
+}
+
+/* ---------- hints & takebacks ---------- */
+function freshUsed() { return { host: { hints: 0, takebacks: 0 }, guest: { hints: 0, takebacks: 0 } }; }
+function helpLeft(who, kind) {
+  if (!state?.help || state[who]?.bot) return 0;
+  return Math.max(0, (state.help[kind] || 0) - (state.used?.[who]?.[kind] || 0));
+}
+// How many plies a takeback by `col` removes: 1 if they just moved, 2 if the opponent
+// has already replied. 0 when they have no move of their own to take back (the
+// simulated opening can't be undone).
+function takebackPlies(col) {
+  if (!state || state.phase !== 'playing') return 0;
+  const n = state.moves.length;
+  const plies = chessFrom(state.moves).turn() === col ? 2 : 1;
+  return n - plies >= state.simCount ? plies : 0;
 }
 
 // Can `col` still deliver mate? (Used for "timeout vs insufficient material".)
@@ -430,7 +493,8 @@ async function maybeBotMove() {
   const c = chessFrom(state.moves);
   if (c.turn() !== botColor()) return;
   botThinking = true;
-  const n = state.moves.length, game = state.game;
+  const n = state.moves.length, game = state.game, undos = state.undos || 0;
+  let stale = false;
   try {
     const rem = clockRemaining(botColor());
     const movetime = rem == null ? 900 : Math.max(120, Math.min(1500, rem / 40));
@@ -439,16 +503,18 @@ async function maybeBotMove() {
     const humanPause = Math.min(300 + Math.random() * 600, rem == null ? 1e9 : rem / 60);
     const wait = humanPause - (Date.now() - t0);
     if (wait > 0) await sleep(wait);
-    if (state.game === game && state.moves.length === n && state.phase === 'playing') {
+    if (state.game === game && state.moves.length === n && (state.undos || 0) === undos && state.phase === 'playing') {
       botThinking = false;
       actOn('guest', { t: 'move', move: mv, n });
       return;
     }
+    stale = true;
   } catch (err) {
     console.error('computer move failed', err);
   } finally {
     botThinking = false;
   }
+  if (stale) setTimeout(maybeBotMove, 0); // the position changed (e.g. a takeback) while it was thinking
 }
 
 async function botConsiderDraw() {
@@ -595,6 +661,7 @@ function showJoinForm(inv) {
     ? `The engine plays the first ${inv.turns} moves (${styleLabel(inv.style ?? 25).toLowerCase()} opening style), tilted toward the lower-rated player. Then it’s your game.`
     : 'A normal game from the starting position.';
   if (inv.tc) $('join-sub').textContent += ` Time control: ${tcLabel(inv.tc)}.`;
+  if (inv.help && (inv.help.hints || inv.help.takebacks)) $('join-sub').textContent += ` Each player gets ${inv.help.hints} best-move hint${inv.help.hints === 1 ? '' : 's'} and ${inv.help.takebacks} takeback${inv.help.takebacks === 1 ? '' : 's'}.`;
   const f = $('join-form');
   f.hidden = false;
   if (profile.name) f.name.value = profile.name;
@@ -717,7 +784,7 @@ function render() {
   const hist = c.history({ verbose: true });
   const last = hist[hist.length - 1];
 
-  const key = `${state.game}|${state.moves.length}|${state.phase}|${orientation}|${viewPly}`;
+  const key = `${state.game}|${state.moves.length}|${state.undos || 0}|${state.phase}|${orientation}|${viewPly}`;
   if (key !== lastRenderedKey) {
     lastRenderedKey = key;
     const dests = new Map();
@@ -735,6 +802,9 @@ function render() {
       movable: { color: canMove ? (mine === 'w' ? 'white' : 'black') : undefined, dests },
     });
   }
+  const showHint = hint && hint.game === state.game && hint.n === state.moves.length && viewPly == null && state.phase === 'playing';
+  if (!showHint) hint = null;
+  cg.setAutoShapes(showHint ? [{ orig: hint.from, dest: hint.to, brush: 'green' }] : []);
   const vb = $('viewing');
   vb.hidden = viewPly == null;
   if (viewPly != null) {
@@ -811,6 +881,29 @@ function renderPlayers(c, orientation, live) {
       sc.textContent = `+${lead}`;
       sc.title = `${lead} point${lead > 1 ? 's' : ''} of material ahead (pawn 1, knight/bishop 3, rook 5, queen 9)`;
       caps.appendChild(sc);
+    }
+    const helpOn = state.help && (state.help.hints || state.help.takebacks) && !p.bot && state.phase !== 'simulating';
+    if (helpOn) {
+      const aids = document.createElement('span');
+      aids.className = 'aids';
+      const h = helpLeft(p.role, 'hints'), t = helpLeft(p.role, 'takebacks');
+      const hs = document.createElement('span');
+      hs.className = 'aid' + (h ? '' : ' out');
+      hs.textContent = `💡${h}`;
+      hs.title = `${h} best-move hint${h === 1 ? '' : 's'} left`;
+      // On a shared device each player can tap their own ↶ to take back their last move.
+      const local = state.mode === 'local';
+      const ts = document.createElement(local ? 'button' : 'span');
+      ts.className = 'aid' + (t ? '' : ' out');
+      ts.textContent = `↶${t}`;
+      ts.title = `${t} takeback${t === 1 ? '' : 's'} left` + (local ? ' — tap to take back this player’s last move' : '');
+      if (local) {
+        ts.type = 'button';
+        ts.disabled = !t || !takebackPlies(color) || viewPly != null;
+        ts.onclick = () => act({ t: 'takeback', color });
+      }
+      aids.append(hs, ts);
+      caps.appendChild(aids);
     }
     nm.appendChild(caps);
     const dot = document.createElement('div');
@@ -1020,10 +1113,28 @@ function renderActions(mine) {
   $('btn-draw').textContent = state.mode === 'local' ? '½ Agree draw' : '½ Offer draw';
   $('btn-resign').disabled = !playing;
   if (!$('btn-resign').dataset.armed) $('btn-resign').textContent = state.mode === 'local' && playing ? `⚑ ${colorName(liveTurn)} resigns` : '⚑ Resign';
+  renderHelpButtons(mine, playing);
   const n = $('notice');
   n.innerHTML = '';
   n.hidden = true;
   if (uiNote) { n.hidden = false; n.textContent = uiNote; }
+  const tb = state.lastTakeback;
+  if (playing && tb && tb.n === state.moves.length && tb.undos === state.undos && !uiNote) {
+    n.hidden = false;
+    n.textContent = state.mode !== 'local' && tb.color === mine ? 'You took back your last move.'
+      : `${playerOf(tb.color).name} took back their last move.`;
+  }
+  if (playing && hint && hint.game === state.game && hint.n === state.moves.length && viewPly == null) {
+    n.hidden = false;
+    n.innerHTML = '';
+    const line = document.createElement('div');
+    line.className = 'hint-line';
+    line.append('💡 Best move: ');
+    const b = document.createElement('b');
+    b.textContent = hint.san;
+    line.appendChild(b);
+    n.appendChild(line);
+  }
   if (playing && state.drawOffer) {
     n.hidden = false;
     if (state.drawOffer === mine) {
@@ -1039,6 +1150,66 @@ function renderActions(mine) {
       n.append(t, row);
     }
   }
+}
+
+function renderHelpButtons(mine, playing) {
+  const row = $('help-actions');
+  const cfg = state.help || { hints: 0, takebacks: 0 };
+  const me = whoOf(mine);
+  const isBot = state.mode === 'bot' && playerOf(mine).bot;
+  row.hidden = (!cfg.hints && !cfg.takebacks) || state.phase === 'simulating' || isBot;
+  if (row.hidden) return;
+  const live = viewPly == null;
+  const myTurn = liveTurn === mine;
+  const hLeft = helpLeft(me, 'hints'), tLeft = helpLeft(me, 'takebacks');
+  const label = (b, text, left) => {
+    b.textContent = text;
+    const pill = document.createElement('span');
+    pill.className = 'left';
+    pill.textContent = left;
+    b.appendChild(pill);
+  };
+  const hb = $('btn-hint');
+  hb.hidden = !cfg.hints;
+  label(hb, hintBusy ? '💡 Thinking…' : '💡 Hint', hLeft);
+  const showing = hint && hint.game === state.game && hint.n === state.moves.length;
+  hb.disabled = !playing || !live || !myTurn || !hLeft || hintBusy || showing;
+  hb.title = !hLeft ? 'No hints left this game' : !myTurn ? 'Hints are available on your turn' : 'Show the engine’s best move';
+  const tbtn = $('btn-takeback');
+  tbtn.hidden = !cfg.takebacks;
+  label(tbtn, '↶ Takeback', tLeft);
+  const plies = takebackPlies(mine);
+  tbtn.disabled = !playing || !live || !tLeft || !plies;
+  tbtn.title = !tLeft ? 'No takebacks left this game' : !plies ? 'You haven’t made a move yet'
+    : plies === 2 ? 'Undo your last move and your opponent’s reply' : 'Undo your last move';
+  row.style.gridTemplateColumns = cfg.hints && cfg.takebacks ? '' : '1fr';
+}
+
+async function requestHint() {
+  if (hintBusy || !state || state.phase !== 'playing' || viewPly != null) return;
+  const mine = myColor();
+  const live = chessFrom(state.moves);
+  if (live.turn() !== mine || helpLeft(whoOf(mine), 'hints') <= 0) return;
+  const game = state.game, n = state.moves.length, undos = state.undos || 0, fen = live.fen();
+  hintBusy = true;
+  // count it right away (the guest updates locally too; the host's state confirms)
+  if (role === 'guest') state.used[whoOf(mine)].hints++;
+  act({ t: 'hint', n });
+  render();
+  try {
+    const mv = await bestMove(fen, 14);
+    if (mv && state.game === game && state.moves.length === n && (state.undos || 0) === undos) {
+      const san = chessFrom(state.moves).move(mv)?.san || `${mv.from}-${mv.to}`;
+      hint = { game, n, from: mv.from, to: mv.to, san };
+    }
+  } catch (err) {
+    console.error('hint failed', err);
+    uiNote = 'Couldn’t compute a hint — the engine failed to load.';
+    setTimeout(() => { uiNote = null; render(); }, 4000);
+  } finally {
+    hintBusy = false;
+  }
+  render();
 }
 
 function btn(text, cls, onclick) {
@@ -1106,6 +1277,8 @@ $('btn-resign').onclick = () => {
 };
 $('btn-draw').onclick = () => act({ t: 'offerDraw' });
 $('btn-flip').onclick = () => { flipped = !flipped; render(); };
+$('btn-hint').onclick = () => requestHint();
+$('btn-takeback').onclick = () => { hint = null; act({ t: 'takeback' }); };
 
 /* ------------------------------------------------------------------ */
 /* Boot                                                                */

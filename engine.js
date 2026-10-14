@@ -105,6 +105,15 @@ export async function botMove(fen, elo, movetime = 800) {
 }
 
 /** Engine evaluation (centipawns, side to move's point of view). */
+// Best move for a hint. Uses the opening engine, which is idle once play has begun
+// (the computer opponent has its own instance with weakened settings).
+export async function bestMove(fen, depth = 14) {
+  const [top] = await getEngine().analyse(fen, { multipv: 1, depth });
+  if (!top?.uci) return null;
+  const u = top.uci;
+  return { from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || undefined, score: top.score };
+}
+
 export async function quickEval(fen, depth = 11) {
   const sf = getBotEngine();
   sf.send('setoption name UCI_LimitStrength value false');

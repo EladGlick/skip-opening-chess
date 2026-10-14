@@ -18,6 +18,12 @@ Three ways to play: **🌐 online with a friend** (send a link), **🤖 against 
    (colors swap) are built in. Running out of time loses, unless the opponent can't possibly mate.
 5. See the material score (pawn 1, knight/bishop 3, rook 5, queen 9) next to each player, open
    **📖 Learn this opening** for its name, ECO code, ideas and links, and click any move to replay the game.
+6. **Help during the game**: each player gets **💡 best-move hints** (default 3) and **↶ takebacks**
+   (default 1), adjustable when you create the game. A takeback works even after your opponent has replied
+   (it undoes both moves). The opening moves the engine played can't be taken back.
+
+**Install it as an app:** click **⬇ Install app** (Chrome, Edge, Android), or on iPhone use Safari → Share →
+Add to Home Screen. After the first visit, vs-computer and same-device games work offline.
 
 ## How it works
 
@@ -47,7 +53,7 @@ python3 -m http.server 8000
 
 ## Ideas for later
 
-Clocks / time controls, sounds, chat, move takeback, PGN export, a TURN server for strict networks.
+Server-backed online games (Firebase), time-odds handicap, sounds, premoves, chat, PGN export, light theme.
 
 ## License
 
