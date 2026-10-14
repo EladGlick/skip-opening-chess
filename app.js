@@ -1,6 +1,7 @@
 import { Chess } from './vendor/chess.js';
 import { Chessground } from './vendor/chessground/chessground.min.js';
-import { simulateOpening, getEngine, getBotEngine, botMove, quickEval, targetAdvantage, bestMove } from './engine.js';
+import { simulateOpening, getEngine, getBotEngine, botMove, quickEval, targetAdvantage, hintAnalysis } from './engine.js';
+import { explainHint } from './explain.js';
 import { loadOpenings, identify, describe, styleLabel, lichessOpeningUrl, lichessAnalysisUrl, wikipediaUrl } from './openings.js';
 
 /* ------------------------------------------------------------------ */
@@ -68,6 +69,7 @@ let botThinking = false;
 let uiNote = null;         // short-lived message shown under the buttons
 let hint = null;           // { game, n, from, to, san } — the best move currently shown to this player
 let hintBusy = false;
+let hintHidden = '';       // `${game}|${n}` of a hint card the player closed (the arrow stays)
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const profile = store.get('profile') || {};
@@ -100,6 +102,15 @@ function parseTc(f) {
 }
 const tcLabel = tc => (tc ? `${+(tc.base / 60000).toFixed(1)}+${tc.inc / 1000}` : 'no clock');
 
+const STYLE_LEVELS = [
+  { name: 'Classic', value: 5, desc: 'Main lines straight out of the opening books.' },
+  { name: 'Mainstream', value: 30, desc: 'Popular openings, with the occasional side line.' },
+  { name: 'Offbeat', value: 55, desc: 'Less common but respectable lines your friend may not know.' },
+  { name: 'Wild', value: 80, desc: 'Rare openings and sharp, unusual ideas.' },
+  { name: 'Crazy', value: 100, desc: 'Almost anything goes, as long as it stays playable.' },
+];
+const styleLevelOf = v => STYLE_LEVELS.reduce((best, l, i) => (Math.abs(l.value - v) < Math.abs(STYLE_LEVELS[best].value - v) ? i : best), 0);
+
 function initCreate() {
   show('screen-create');
   const f = $('create-form');
@@ -114,9 +125,19 @@ function initCreate() {
   const out = $('turns-out');
   const sync = () => { out.textContent = f.turns.value === '0' ? 'Off' : `${f.turns.value} moves`; };
   f.turns.addEventListener('input', sync); sync();
-  if (profile.style != null) f.style.value = profile.style;
-  const syncStyle = () => { $('style-out').textContent = styleLabel(+f.style.value); };
-  f.style.addEventListener('input', syncStyle); syncStyle();
+  // Opening style: five fixed levels (no in-between values)
+  if (profile.style != null) f.styleLevel.value = styleLevelOf(profile.style);
+  const syncStyle = () => {
+    const lvl = +f.styleLevel.value;
+    $('style-out').textContent = STYLE_LEVELS[lvl].name;
+    $('style-desc').textContent = STYLE_LEVELS[lvl].desc;
+    for (const b of document.querySelectorAll('#style-ticks button')) b.classList.toggle('on', +b.dataset.level === lvl);
+  };
+  f.styleLevel.addEventListener('input', syncStyle);
+  for (const b of document.querySelectorAll('#style-ticks button')) {
+    b.addEventListener('click', () => { f.styleLevel.value = b.dataset.level; f.styleLevel.dispatchEvent(new Event('input')); });
+  }
+  syncStyle();
   const botLevel = v => v < 800 ? 'Beginner' : v < 1200 ? 'Casual' : v < 1600 ? 'Club player' : v < 2000 ? 'Strong' : v < 2400 ? 'Expert' : 'Master';
   const syncBot = () => { $('bot-out').textContent = `${f.botRating.value} · ${botLevel(+f.botRating.value)}`; };
   f.botRating.addEventListener('input', syncBot); syncBot();
@@ -124,8 +145,29 @@ function initCreate() {
     const est = min + (inc * 40) / 60;           // estimated minutes per player for a 40-move game
     return est < 3 ? 'Bullet' : est < 8 ? 'Blitz' : est < 25 ? 'Rapid' : 'Classical';
   };
+  // Time control in two steps: pick a type, then a length within it.
+  const typeOf = v => {
+    if (v === 'custom' || v === '') return 'custom';
+    const [m, i] = v.split('+').map(Number);
+    return tcCategory(m, i).toLowerCase();
+  };
+  const lastPick = {};
+  const showType = type => {
+    for (const el of f.querySelectorAll('.tc-lengths')) el.hidden = el.dataset.type !== type;
+  };
+  for (const r of f.tcType) r.addEventListener('change', () => {
+    const type = f.tcType.value;
+    showType(type);
+    const opts = [...f.querySelectorAll(`.tc-lengths[data-type="${type}"] input[name=tc]`)];
+    const keep = opts.find(o => o.value === lastPick[type]) || opts[0];
+    keep.checked = true;
+    syncTc();
+  });
   const syncTc = () => {
     const v = f.tc.value;
+    const type = typeOf(v);
+    lastPick[type] = v;
+    if (f.tcType.value !== type) { f.tcType.value = type; showType(type); }
     $('tc-custom').hidden = v !== 'custom';
     let label;
     if (!v) label = 'No clock';
@@ -189,7 +231,8 @@ function initCreate() {
     const botRating = +f.botRating.value;
     const clampInt = (v, max) => Math.max(0, Math.min(max, Math.round(+v) || 0));
     const help = { hints: clampInt(f.hints.value, 10), takebacks: clampInt(f.takebacks.value, 5) };
-    store.set('profile', { ...profile, name, rating, style: +f.style.value, mode, tc: f.tc.value,
+    const style = STYLE_LEVELS[+f.styleLevel.value].value;
+    store.set('profile', { ...profile, name, rating, style, mode, tc: f.tc.value,
       botRating, name2: f.name2.value.trim(), rating2, hints: help.hints, takebacks: help.takebacks });
     gameId = randId();
     state = {
@@ -197,7 +240,7 @@ function initCreate() {
       mode,
       phase: 'lobby',
       turns: +f.turns.value,
-      style: +f.style.value,
+      style,
       tc: parseTc(f),
       clock: null,
       help,
@@ -882,7 +925,10 @@ function renderPlayers(c, orientation, live) {
       sc.title = `${lead} point${lead > 1 ? 's' : ''} of material ahead (pawn 1, knight/bishop 3, rook 5, queen 9)`;
       caps.appendChild(sc);
     }
-    const helpOn = state.help && (state.help.hints || state.help.takebacks) && !p.bot && state.phase !== 'simulating';
+    // Counters on the player bars: your own are on the toolbar, so show them only for the
+    // opponent (both players on a shared device).
+    const helpOn = state.help && (state.help.hints || state.help.takebacks) && !p.bot && state.phase !== 'simulating'
+      && (state.mode === 'local' || p.role !== role);
     if (helpOn) {
       const aids = document.createElement('span');
       aids.className = 'aids';
@@ -987,6 +1033,8 @@ function renderMoves() {
   ol.innerHTML = '';
   const total = state.moves.length;
   const simEnd = state.phase === 'simulating' ? total : state.simCount;
+  $('moves-sub').textContent = !total ? '' : viewPly != null ? `Reviewing move ${Math.ceil(viewPly / 2) || 0}`
+    : `${Math.ceil(total / 2)} move${total > 2 ? 's' : ''}` + (state.simCount && state.phase !== 'simulating' ? ` · ${Math.ceil(state.simCount / 2)} by the engine` : '');
   for (let i = 0; i < total; i += 2) {
     if (i === simEnd && simEnd > 0) ol.appendChild(divider());
     const li = document.createElement('li');
@@ -1070,7 +1118,6 @@ function renderLearn() {
   const info = identify(simMoves);
   if (!info) { loadOpenings().then(() => render()); return; }
   learnKey = key;
-  if (box.hidden) box.open = window.innerWidth > 820;
   box.hidden = false;
   $('learn-name').textContent = info.name;
   const body = $('learn-body');
@@ -1084,9 +1131,6 @@ function renderLearn() {
   head.append(eco, nm, st);
 
   add('p', null, describe(info, state.style ?? 25));
-
-  const pgn = simMoves.map((m, i) => (i % 2 === 0 ? `${i / 2 + 1}. ` : '') + m).join(' ');
-  add('p', 'pgn', pgn);
 
   let theory;
   const bp = info.bookPly;
@@ -1110,13 +1154,16 @@ function renderLearn() {
 function renderActions(mine) {
   const playing = state.phase === 'playing';
   $('btn-draw').disabled = !playing || !!state.drawOffer;
-  $('btn-draw').textContent = state.mode === 'local' ? '½ Agree draw' : '½ Offer draw';
+  setTbtn($('btn-draw'), '½', 'Draw');
+  $('btn-draw').title = state.mode === 'local' ? 'Agree to a draw' : 'Offer a draw';
   $('btn-resign').disabled = !playing;
-  if (!$('btn-resign').dataset.armed) $('btn-resign').textContent = state.mode === 'local' && playing ? `⚑ ${colorName(liveTurn)} resigns` : '⚑ Resign';
+  if (!$('btn-resign').dataset.armed) setTbtn($('btn-resign'), '⚑', 'Resign');
+  $('btn-resign').title = state.mode === 'local' && playing ? `${colorName(liveTurn)} resigns` : 'Resign';
   renderHelpButtons(mine, playing);
   const n = $('notice');
   n.innerHTML = '';
   n.hidden = true;
+  n.classList.remove('hint-card');
   if (uiNote) { n.hidden = false; n.textContent = uiNote; }
   const tb = state.lastTakeback;
   if (playing && tb && tb.n === state.moves.length && tb.undos === state.undos && !uiNote) {
@@ -1124,16 +1171,36 @@ function renderActions(mine) {
     n.textContent = state.mode !== 'local' && tb.color === mine ? 'You took back your last move.'
       : `${playerOf(tb.color).name} took back their last move.`;
   }
-  if (playing && hint && hint.game === state.game && hint.n === state.moves.length && viewPly == null) {
+  if (playing && hint && hint.game === state.game && hint.n === state.moves.length && viewPly == null && hintHidden !== `${hint.game}|${hint.n}`) {
     n.hidden = false;
     n.innerHTML = '';
+    n.classList.add('hint-card');
     const line = document.createElement('div');
     line.className = 'hint-line';
     line.append('💡 Best move: ');
     const b = document.createElement('b');
     b.textContent = hint.san;
     line.appendChild(b);
-    n.appendChild(line);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'hint-close';
+    close.setAttribute('aria-label', 'Hide hint');
+    close.textContent = '×';
+    close.onclick = () => { hintHidden = `${hint.game}|${hint.n}`; render(); };
+    line.appendChild(close);
+    const ul = document.createElement('ul');
+    ul.className = 'hint-why';
+    for (const r of hint.reasons || []) { const li = document.createElement('li'); li.textContent = r; ul.appendChild(li); }
+    const v = document.createElement('p');
+    v.className = 'hint-verdict';
+    v.textContent = hint.verdict || '';
+    n.append(line, ul, v);
+    if (hint.line) {
+      const pl = document.createElement('p');
+      pl.className = 'hint-pv';
+      pl.textContent = `Engine’s expected line: ${hint.line}`;
+      n.appendChild(pl);
+    }
   }
   if (playing && state.drawOffer) {
     n.hidden = false;
@@ -1152,37 +1219,42 @@ function renderActions(mine) {
   }
 }
 
+// Toolbar buttons: an icon, a short label and an optional count badge.
+function setTbtn(b, icon, label, count) {
+  b.textContent = icon;
+  const l = document.createElement('span');
+  l.className = 'tl';
+  l.textContent = label;
+  b.appendChild(l);
+  if (count != null) {
+    const c = document.createElement('span');
+    c.className = 'cnt';
+    c.textContent = count;
+    b.appendChild(c);
+  }
+}
+
 function renderHelpButtons(mine, playing) {
-  const row = $('help-actions');
   const cfg = state.help || { hints: 0, takebacks: 0 };
   const me = whoOf(mine);
   const isBot = state.mode === 'bot' && playerOf(mine).bot;
-  row.hidden = (!cfg.hints && !cfg.takebacks) || state.phase === 'simulating' || isBot;
-  if (row.hidden) return;
+  const off = state.phase === 'simulating' || isBot;
   const live = viewPly == null;
   const myTurn = liveTurn === mine;
   const hLeft = helpLeft(me, 'hints'), tLeft = helpLeft(me, 'takebacks');
-  const label = (b, text, left) => {
-    b.textContent = text;
-    const pill = document.createElement('span');
-    pill.className = 'left';
-    pill.textContent = left;
-    b.appendChild(pill);
-  };
   const hb = $('btn-hint');
-  hb.hidden = !cfg.hints;
-  label(hb, hintBusy ? '💡 Thinking…' : '💡 Hint', hLeft);
+  hb.hidden = !cfg.hints || off;
+  setTbtn(hb, '💡', hintBusy ? 'Thinking…' : 'Hint', hLeft);
   const showing = hint && hint.game === state.game && hint.n === state.moves.length;
   hb.disabled = !playing || !live || !myTurn || !hLeft || hintBusy || showing;
-  hb.title = !hLeft ? 'No hints left this game' : !myTurn ? 'Hints are available on your turn' : 'Show the engine’s best move';
+  hb.title = !hLeft ? 'No hints left this game' : !myTurn ? 'Hints are available on your turn' : 'Show the engine’s best move, and why';
   const tbtn = $('btn-takeback');
-  tbtn.hidden = !cfg.takebacks;
-  label(tbtn, '↶ Takeback', tLeft);
+  tbtn.hidden = !cfg.takebacks || off;
+  setTbtn(tbtn, '↶', 'Undo', tLeft);
   const plies = takebackPlies(mine);
   tbtn.disabled = !playing || !live || !tLeft || !plies;
   tbtn.title = !tLeft ? 'No takebacks left this game' : !plies ? 'You haven’t made a move yet'
-    : plies === 2 ? 'Undo your last move and your opponent’s reply' : 'Undo your last move';
-  row.style.gridTemplateColumns = cfg.hints && cfg.takebacks ? '' : '1fr';
+    : plies === 2 ? 'Take back your last move and your opponent’s reply' : 'Take back your last move';
 }
 
 async function requestHint() {
@@ -1197,10 +1269,10 @@ async function requestHint() {
   act({ t: 'hint', n });
   render();
   try {
-    const mv = await bestMove(fen, 14);
-    if (mv && state.game === game && state.moves.length === n && (state.undos || 0) === undos) {
-      const san = chessFrom(state.moves).move(mv)?.san || `${mv.from}-${mv.to}`;
-      hint = { game, n, from: mv.from, to: mv.to, san };
+    const analysis = await hintAnalysis(fen, 14);
+    if (analysis.lines[0]?.uci && state.game === game && state.moves.length === n && (state.undos || 0) === undos) {
+      const ex = explainHint(fen, analysis);
+      hint = { game, n, ...ex };
     }
   } catch (err) {
     console.error('hint failed', err);
@@ -1270,13 +1342,27 @@ function renderWait() {
 let resignTimer = null;
 $('btn-resign').onclick = () => {
   const b = $('btn-resign');
-  if (b.dataset.armed) { clearTimeout(resignTimer); delete b.dataset.armed; b.textContent = '⚑ Resign'; act({ t: 'resign' }); return; }
+  if (b.dataset.armed) { clearTimeout(resignTimer); delete b.dataset.armed; setTbtn(b, '⚑', 'Resign'); act({ t: 'resign' }); return; }
   b.dataset.armed = '1';
-  b.textContent = 'Click to confirm';
-  resignTimer = setTimeout(() => { delete b.dataset.armed; b.textContent = '⚑ Resign'; }, 3000);
+  setTbtn(b, '⚑', 'Sure?');
+  resignTimer = setTimeout(() => { delete b.dataset.armed; setTbtn(b, '⚑', 'Resign'); }, 3000);
 };
 $('btn-draw').onclick = () => act({ t: 'offerDraw' });
 $('btn-flip').onclick = () => { flipped = !flipped; render(); };
+for (const head of document.querySelectorAll('.sec-head')) {
+  head.addEventListener('click', () => {
+    const sec = head.parentElement;
+    const open = !sec.classList.contains('open');
+    // accordion: one section at a time keeps the panel calm
+    for (const other of document.querySelectorAll('.sec')) {
+      other.classList.toggle('open', other === sec ? open : false);
+      other.querySelector('.sec-head').setAttribute('aria-expanded', other.classList.contains('open'));
+    }
+    if (!open && sec.id === 'learn') { // closing the opening shows the moves again
+      const mv = $('moves-sec'); mv.classList.add('open'); mv.querySelector('.sec-head').setAttribute('aria-expanded', 'true');
+    }
+  });
+}
 $('btn-hint').onclick = () => requestHint();
 $('btn-takeback').onclick = () => { hint = null; act({ t: 'takeback' }); };
 

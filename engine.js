@@ -48,8 +48,8 @@ class Stockfish {
       const si = t.indexOf('score');
       let score = +t[si + 2];
       if (t[si + 1] === 'mate') score = score > 0 ? MATE - score : -MATE - score;
-      const uci = t[t.indexOf('pv') + 1];
-      byPv.set(pvIdx, { uci, score }); // later (deeper) lines overwrite earlier ones
+      const pv = t.slice(t.indexOf('pv') + 1);
+      byPv.set(pvIdx, { uci: pv[0], score, pv }); // later (deeper) lines overwrite earlier ones
     }
     return [...byPv.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
   }
@@ -105,13 +105,45 @@ export async function botMove(fen, elo, movetime = 800) {
 }
 
 /** Engine evaluation (centipawns, side to move's point of view). */
-// Best move for a hint. Uses the opening engine, which is idle once play has begun
+// Analysis for a hint. Uses the opening engine, which is idle once play has begun
 // (the computer opponent has its own instance with weakened settings).
-export async function bestMove(fen, depth = 14) {
-  const [top] = await getEngine().analyse(fen, { multipv: 1, depth });
-  if (!top?.uci) return null;
-  const u = top.uci;
-  return { from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || undefined, score: top.score };
+// Returns the top lines plus what the opponent would do if it were their move
+// (the "threat"), which the explanation uses to say what the move prevents.
+export async function hintAnalysis(fen, depth = 14) {
+  const sf = getEngine();
+  const lines = await sf.analyse(fen, { multipv: 3, depth });
+  let threat = null;
+  const parts = fen.split(' ');
+  const c = new Chess(fen);
+  if (!c.inCheck()) {
+    parts[1] = parts[1] === 'w' ? 'b' : 'w';
+    parts[3] = '-';
+    const nullFen = parts.join(' ');
+    try {
+      new Chess(nullFen); // throws if the null move is illegal
+      const [t] = await sf.analyse(nullFen, { multipv: 1, depth: 10 });
+      if (t) threat = { ...t, fen: nullFen };
+    } catch { /* ignore */ }
+  }
+  // What the move threatens: our best follow-up if the opponent "passed".
+  let follow = null;
+  try {
+    const after = new Chess(fen);
+    const u = lines[0]?.uci;
+    if (u) {
+      after.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || undefined });
+      if (!after.inCheck() && !after.isGameOver()) {
+        const p2 = after.fen().split(' ');
+        p2[1] = p2[1] === 'w' ? 'b' : 'w';
+        p2[3] = '-';
+        const f2 = p2.join(' ');
+        new Chess(f2);
+        const [f] = await sf.analyse(f2, { multipv: 1, depth: 10 });
+        if (f) follow = { ...f, fen: f2 };
+      }
+    }
+  } catch { /* ignore */ }
+  return { lines, threat, follow };
 }
 
 export async function quickEval(fen, depth = 11) {
