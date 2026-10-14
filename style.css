@@ -86,6 +86,19 @@ button, input, select { font: inherit; color: inherit; }
 main { flex: 1; display: flex; justify-content: center; align-items: flex-start; padding: 8px 16px 32px; }
 .foot { text-align: center; color: var(--faint); font-size: 12px; padding: 16px; }
 
+.top-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.btn.install { padding: 6px 12px; font-size: 13px; border-radius: 999px; }
+.offline-note {
+  margin: 0; padding: 10px 12px; border-radius: var(--r-sm); font-size: 13.5px; color: var(--text);
+  background: rgba(233, 196, 106, .12); border: 1px solid rgba(233, 196, 106, .35);
+}
+.toast {
+  position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 50;
+  background: var(--surface-2); border: 1px solid var(--line-strong); color: var(--text);
+  padding: 10px 16px; border-radius: 999px; font-size: 14px; box-shadow: 0 10px 30px rgba(0,0,0,.4);
+  animation: rise var(--med) var(--ease) both; max-width: calc(100vw - 32px);
+}
+
 /* ---------- cards ---------- */
 .card {
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);

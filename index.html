@@ -6,7 +6,13 @@
   <meta name="theme-color" content="#1c1d21">
   <title>Skip Opening Chess</title>
   <meta name="description" content="Play chess online, against the computer or on one device. Skip the opening, and let the rating gap decide who starts ahead.">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>♞</text></svg>">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Skip Chess">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
@@ -17,7 +23,10 @@
 <body>
   <header class="top">
     <a class="brand" href="./"><span class="brand-mark">♞</span><span>Skip Opening Chess</span></a>
-    <span class="conn" id="conn" hidden></span>
+    <div class="top-right">
+      <button class="btn ghost install" id="install-btn" type="button" hidden>⬇ Install app</button>
+      <span class="conn" id="conn" hidden></span>
+    </div>
   </header>
 
   <main>
@@ -168,6 +177,7 @@
           <label class="check" data-show="local"><input type="checkbox" name="autoFlip"><span>Flip the board after every move</span></label>
         </fieldset>
 
+        <p class="offline-note" id="offline-note" hidden>📴 You're offline. Playing a friend online needs internet; <b>Computer</b> and <b>Same device</b> work offline.</p>
         <button class="btn primary big" type="submit" id="create-btn">Create game &amp; get link</button>
       </form>
     </section>

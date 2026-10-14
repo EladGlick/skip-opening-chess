@@ -1111,6 +1111,46 @@ $('btn-flip').onclick = () => { flipped = !flipped; render(); };
 /* Boot                                                                */
 /* ------------------------------------------------------------------ */
 loadOpenings().then(() => { if (state) render(); });
+
+/* ------------------------------------------------------------------ */
+/* Installable app + offline support                                   */
+/* ------------------------------------------------------------------ */
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+  navigator.serviceWorker.register('sw.js').catch(err => console.warn('service worker', err));
+}
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  installPrompt = e;
+  $('install-btn').hidden = false;
+});
+$('install-btn').onclick = async () => {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  await installPrompt.userChoice.catch(() => null);
+  installPrompt = null;
+  $('install-btn').hidden = true;
+};
+window.addEventListener('appinstalled', () => { $('install-btn').hidden = true; toast('Installed! You can now open Skip Chess from your home screen.'); });
+
+function toast(text, ms = 3500) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = text;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), ms);
+}
+function syncOnline() {
+  const f = $('create-form');
+  const offline = !navigator.onLine;
+  if (f) $('offline-note').hidden = !(offline && f.mode.value === 'online');
+  const btn = $('create-btn');
+  if (btn && f) btn.disabled = offline && f.mode.value === 'online';
+}
+window.addEventListener('online', () => { syncOnline(); if (state?.mode === 'online') toast('Back online.'); });
+window.addEventListener('offline', () => { syncOnline(); if (state?.mode === 'online') toast('You are offline. The game will reconnect when the internet is back.'); });
+for (const r of document.querySelectorAll('#create-form input[name=mode]')) r.addEventListener('change', syncOnline);
+syncOnline();
 if (!gameId) {
   initCreate();
 } else {

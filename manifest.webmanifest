@@ -1,0 +1,17 @@
+{
+  "name": "Skip Opening Chess",
+  "short_name": "Skip Chess",
+  "description": "Chess without the opening: online with a friend, against the computer, or on one device.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1b1c20",
+  "theme_color": "#1b1c20",
+  "categories": ["games"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
