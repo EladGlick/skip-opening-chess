@@ -5,13 +5,12 @@
 //  - Our own code (html/js/css/manifest): network-first, so updates show up right away
 //    when online, with the cached copy as the offline fallback.
 //  - Third-party data (Lichess opening names, Google Fonts): stale-while-revalidate.
-const VERSION = 'v3';
+const VERSION = 'v4';
 const CORE = `core-${VERSION}`;
 const RUNTIME = `runtime-${VERSION}`;
 
 const VENDOR = [
   'vendor/chess.js',
-  'vendor/peerjs.min.js',
   'vendor/chessground/chessground.min.js',
   'vendor/chessground/chessground.base.css',
   'vendor/chessground/chessground.cburnett.css',
@@ -22,7 +21,7 @@ const VENDOR = [
   'icons/maskable-512.png',
   'icons/apple-touch-icon.png',
 ];
-const APP = ['./', 'index.html', 'app.js', 'engine.js', 'explain.js', 'review.js', 'handicap.js', 'sound.js', 'openings.js', 'style.css', 'manifest.webmanifest'];
+const APP = ['./', 'index.html', 'app.js', 'engine.js', 'explain.js', 'review.js', 'handicap.js', 'sound.js', 'net.js', 'firebase-config.js', 'openings.js', 'style.css', 'manifest.webmanifest'];
 const OPENINGS = 'https://raw.githubusercontent.com/lichess-org/chess-openings/a6189a30dc273ccb21fc2536a9a2fefd5592a67a/';
 const EXTRA = [...'abcde'].map(x => `${OPENINGS}${x}.tsv`);
 
@@ -54,9 +53,10 @@ self.addEventListener('fetch', event => {
   const url = new URL(req.url);
 
   // Never touch live game traffic (PeerJS signalling, Firebase, Google APIs).
-  const live = ['peerjs', 'firebase', 'firebaseio', 'googleapis.com', 'gstatic.com/firebasejs'];
+  // (only other sites: our own firebase-config.js must still be cached for offline use)
+  const live = ['peerjs', 'firebase', 'firebaseio', 'googleapis.com'];
   const isFont = url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com';
-  if (!isFont && live.some(k => (url.hostname + url.pathname).includes(k))) return;
+  if (url.origin !== self.location.origin && !isFont && live.some(k => url.hostname.includes(k))) return;
 
   if (url.origin === self.location.origin) {
     if (req.mode === 'navigate') {

@@ -4,6 +4,8 @@ import { simulateOpening, getEngine, getBotEngine, botMove, quickEval, targetAdv
 import { explainHint } from './explain.js';
 import { planHandicap, learnK, edgeWords } from './handicap.js';
 import { play, soundFor, setSoundEnabled } from './sound.js';
+import { signIn, db, listen, myUid, nowS, syncClock, TIMESTAMP, NO_ETAG } from './net.js';
+import { skipRatings, headToHead, myGames } from './scores.js';
 import { analyseGame, CLASSES, SUMMARY_ORDER, KEY_CLASSES, toPgn, lichessPgnUrl } from './review.js';
 import { loadOpenings, identify, describe, styleLabel, lichessOpeningUrl, lichessAnalysisUrl, wikipediaUrl } from './openings.js';
 
@@ -11,18 +13,8 @@ import { loadOpenings, identify, describe, styleLabel, lichessOpeningUrl, liches
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 const $ = id => document.getElementById(id);
-const PEER_PREFIX = 'skipopening-v1-';
-// `?signal=host:port` points at a self-hosted PeerJS server (used for local testing).
-const SIGNAL = new URLSearchParams(location.search).get('signal');
-const PEER_OPTS = {
-  debug: 1,
-  ...(SIGNAL ? { host: SIGNAL.split(':')[0], port: +SIGNAL.split(':')[1] || 9000, path: '/', secure: false } : {}),
-  config: { iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:global.stun.twilio.com:3478' },
-  ] },
-};
+// `?fb=…` (local test server) is kept in every link we make.
+const FBQ = new URLSearchParams(location.search).get('fb') ? `&fb=${encodeURIComponent(new URLSearchParams(location.search).get('fb'))}` : '';
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ } },
@@ -55,18 +47,14 @@ function resultOf(c) {
 /* ------------------------------------------------------------------ */
 const params = new URLSearchParams(location.search);
 let gameId = params.get('game');
-let role = null;           // 'host' | 'guest'
-let state = null;          // shared game state (host is the source of truth)
-let peer = null;
-let conn = null;           // host: the guest's connection; guest: connection to host
-let guestToken = null;
+let role = null;           // 'host' (created the game) | 'guest' (joined) | 'joining' | 'full'
+let state = null;          // shared game state (online: the copy in Firebase is the source of truth)
 let flipped = false;
 let cg = null;
 let simulating = false;
 let lastRenderedKey = '';
 let viewPly = null;        // null = live position; otherwise number of plies shown while reviewing
 let autoplay = null;
-let clockOffset = 0;       // guest: host clock minus local clock
 let liveTurn = 'w';        // side to move in the live position (cached by render)
 let botThinking = false;
 let uiNote = null;         // short-lived message shown under the buttons
@@ -118,7 +106,7 @@ function initPrefs() {
 /* Screens                                                             */
 /* ------------------------------------------------------------------ */
 function show(id) {
-  for (const s of ['screen-create', 'screen-wait', 'screen-join', 'screen-game']) $(s).hidden = s !== id;
+  for (const s of ['screen-create', 'screen-wait', 'screen-join', 'screen-game', 'screen-scores']) $(s).hidden = s !== id;
 }
 function setConn(text, cls) {
   const el = $('conn');
@@ -295,13 +283,12 @@ function initCreate() {
       result: null, drawOffer: null, rematch: { host: false, guest: false },
     };
     role = 'host';
-    saveHost();
-    history.replaceState(null, '', `?game=${gameId}` + (SIGNAL ? `&signal=${SIGNAL}` : ''));
     getEngine(); // start loading Stockfish now so it's warm
     if (mode === 'online') {
-      startHost();
-      render();
+      createOnline(name, rating);
     } else {
+      saveHost();
+      history.replaceState(null, '', `?game=${gameId}${FBQ}`);
       if (mode === 'bot') getBotEngine();
       setConn(mode === 'bot' ? 'vs computer' : 'Same device', 'on');
       startGame(pickWhite());
@@ -314,73 +301,12 @@ function initCreate() {
 /* ------------------------------------------------------------------ */
 function saveHost() { store.set('host:' + gameId, state); }
 
-function startHost() {
-  setConn('Starting…');
-  peer = new Peer(PEER_PREFIX + gameId, PEER_OPTS);
-  peer.on('open', () => {
-    setConn(state.guest ? `Waiting for ${state.guest.name} to reconnect…` : 'Online', state.guest ? '' : 'on');
-    render();
-    if (state.phase === 'simulating') runSimulation(); // resume after a refresh
-  });
-  peer.on('connection', c => {
-    c.on('data', msg => hostHandle(c, msg));
-    c.on('close', () => {
-      if (c === conn) { conn = null; setConn(`${state.guest?.name || 'Friend'} disconnected`, 'off'); }
-    });
-  });
-  peer.on('disconnected', () => safeReconnect(peer));
-  peer.on('error', err => {
-    if (err.type === 'unavailable-id') {
-      // Our old id is still held by the server (e.g. after a refresh). Retry shortly.
-      setConn('Reconnecting…', 'off');
-      peer.destroy();
-      setTimeout(startHost, 3000);
-    } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-      setConn('Connection problem — retrying…', 'off');
-      if (!peer.open && !peer.destroyed) { peer.destroy(); setTimeout(startHost, 5000); }
-    } else {
-      console.warn('peer error', err);
-    }
-  });
-}
-
 function broadcast() {
+  if (isOnline()) return;          // online changes are saved by apply() → mutate()
   state.v++;
   saveHost();
-  if (conn && conn.open) conn.send({ t: 'state', state, now: Date.now() });
   render();
   maybeBotMove();
-}
-
-function hostHandle(c, msg) {
-  if (!msg || typeof msg !== 'object') return;
-  const isGuest = c === conn;
-  switch (msg.t) {
-    case 'hello':
-      if (state.guest && state.guest.token === msg.token) {
-        conn = c;
-        setConn(`Connected to ${state.guest.name}`, 'on');
-        c.send({ t: 'state', state, now: Date.now() });
-      } else if (!state.guest) {
-        c.send({ t: 'invite', host: state.host, turns: state.turns, style: state.style ?? 25, tc: state.tc || null, help: state.help || null });
-      } else {
-        c.send({ t: 'full' });
-      }
-      return;
-    case 'join':
-      if (state.guest) { if (state.guest.token !== msg.token) c.send({ t: 'full' }); return; }
-      state.guest = {
-        name: String(msg.name || 'Friend').slice(0, 20),
-        rating: Math.max(100, Math.min(3500, Math.round(+msg.rating) || 1200)),
-        token: String(msg.token),
-      };
-      conn = c;
-      setConn(`Connected to ${state.guest.name}`, 'on');
-      startGame(pickWhite());
-      return;
-  }
-  if (!isGuest) return;
-  actOn('guest', msg);
 }
 
 function pickWhite() {
@@ -396,51 +322,76 @@ function startGame(white, replay = null) {
     result: null, drawOffer: null, rematch: { host: false, guest: false },
     used: freshUsed(), lastTakeback: null, undos: 0,
     replay, rematchSame: false,
+    simLock: isOnline() ? { by: myUid(), at: nowS() } : null,   // whose browser runs the engine
   });
   hint = null;
   review = null;
+  if (isOnline()) return;          // the simulation starts once this change is saved (see afterChange)
   broadcast();
   runSimulation();
 }
 
+// The engine plays the opening. Online, whichever player started the game runs it
+// (or the other one takes over if that browser went away).
 async function runSimulation() {
-  if (simulating) return;
+  if (simulating || !state || state.phase !== 'simulating') return;
   simulating = true;
-  state.moves = [];
-  const rating = r => (state.white === r ? state[r].rating : null);
-  const whiteRating = rating('host') ?? rating('guest');
-  const blackRating = state.white === 'host' ? state.guest.rating : state.host.rating;
+  const game = state.game;
+  const online = isOnline();
+  const mine = () => state.game === game && state.phase === 'simulating' && (!online || state.simLock?.by === myUid());
+  const moves = [];
   try {
+    // claim the job (and start from an empty board)
+    await apply(() => {
+      if (state.game !== game || state.phase !== 'simulating') return;
+      state.moves = [];
+      if (online) state.simLock = { by: myUid(), at: nowS() };
+    });
+    if (!mine()) return;
+    const step = () => apply(() => {
+      if (!mine()) return;
+      state.moves = moves.slice();
+      if (online) state.simLock = { by: myUid(), at: nowS() };
+    });
+    const ratingOf = r => state[r].rating;
+    const whiteRating = ratingOf(state.white);
+    const blackRating = ratingOf(state.white === 'host' ? 'guest' : 'host');
+    let sim;
     if (state.replay?.moves?.length) {
       // rematch with the same opening: replay the moves the engine chose last game
-      for (const san of state.replay.moves) { state.moves.push(san); broadcast(); await sleep(120); }
-      state.sim = state.replay.sim || { evalWhite: 0, target: 0, favored: null };
+      for (const san of state.replay.moves) { moves.push(san); await step(); await sleep(120); if (!mine()) return; }
+      sim = state.replay.sim || { evalWhite: 0, target: 0, favored: null };
     } else if (state.turns > 0) {
       const recent = store.get('recentStarts') || [];
       const plan = planHandicap({ whiteRating, blackRating, results: allResults() });
       const res = await simulateOpening({
         whiteRating, blackRating, turns: state.turns, style: state.style ?? 25, avoid: recent,
         targetWhite: plan.targetWhite, positional: plan.positional,
-        onMove: ({ san }) => { state.moves.push(san); broadcast(); },
+        onMove: ({ san }) => { moves.push(san); step(); },
       });
-      state.sim = { evalWhite: res.evalWhite, target: res.target, favored: res.favored, materialWhite: res.materialWhite, plan };
+      sim = { evalWhite: res.evalWhite, target: res.target, favored: res.favored, materialWhite: res.materialWhite, plan };
       const starts = [res.moves.slice(0, 4).join(' '), res.moves.slice(0, 8).join(' ')];
       store.set('recentStarts', [...starts, ...recent].slice(0, 40));
     } else {
-      state.sim = { evalWhite: 0, target: 0, favored: null };
+      sim = { evalWhite: 0, target: 0, favored: null };
     }
-    state.simCount = state.moves.length;
-    const r = resultOf(chessFrom(state.moves));
-    state.phase = r ? 'over' : 'playing';
-    state.result = r;
-    state.clock = state.tc && !r ? { w: state.tc.base, b: state.tc.base, since: Date.now() } : null;
+    await apply(() => {
+      if (!mine()) return;
+      state.moves = moves.slice();
+      state.sim = sim;
+      state.simCount = moves.length;
+      const r = resultOf(chessFrom(moves));
+      state.phase = r ? 'over' : 'playing';
+      state.result = r;
+      state.simLock = null;
+      state.clock = state.tc && !r ? { w: state.tc.base, b: state.tc.base, since: nowS() } : null;
+    });
   } catch (err) {
     console.error(err);
     alert('The opening engine failed to load. Try refreshing the page.');
   } finally {
     simulating = false;
   }
-  broadcast();
 }
 
 // Apply an action from a player ('host' | 'guest'). Host only.
@@ -448,16 +399,16 @@ function actOn(who, msg) {
   const color = state.white === who ? 'w' : 'b';
   switch (msg.t) {
     case 'move': {
-      if (state.phase !== 'playing' || msg.n !== state.moves.length) { conn?.send({ t: 'state', state }); return; }
+      if (state.phase !== 'playing' || msg.n !== state.moves.length) return;
       const c = chessFrom(state.moves);
       if (c.turn() !== color) return;
       let m;
       try { m = c.move(msg.move); } catch { m = null; }
-      if (!m) { conn?.send({ t: 'state', state }); return; }
+      if (!m) return;
       if (state.clock?.since) {
-        const now = Date.now();
+        const now = nowS();
         const rem = state.clock[color] - (now - state.clock.since);
-        if (rem <= 0) { flag(color); return; }
+        if (rem <= 0) { flagNow(color); break; }
         state.clock[color] = rem + state.tc.inc;
         state.clock.since = now;
       }
@@ -503,7 +454,7 @@ function actOn(who, msg) {
       if (!plies || helpLeft(owner, 'takebacks') <= 0) return;
       if (state.clock?.since) {
         const t = chessFrom(state.moves).turn();
-        const now = Date.now();
+        const now = nowS();
         state.clock[t] = Math.max(0, state.clock[t] - (now - state.clock.since));
         state.clock.since = now;
       }
@@ -534,32 +485,68 @@ function actOn(who, msg) {
 }
 
 /* ---------- results (feed the handicap learning and the scoreboard) ---------- */
-function allResults() { return store.get('results') || []; }
+let remoteResults = [];            // everyone's results, loaded from Firebase
+function allResults() {
+  const seen = new Set();
+  const out = [];
+  for (const r of [...(store.get('results') || []), ...remoteResults]) {
+    if (!r?.rid || seen.has(r.rid)) continue;
+    seen.add(r.rid);
+    out.push(r);
+  }
+  return out;
+}
 function recordResult() {
-  if (role !== 'host' || state.phase !== 'over' || !state.result || !state.white) return;
-  const rid = `${state.id}_${state.game}`;
-  const list = allResults();
+  if (role !== 'host' && role !== 'guest') return;
+  // online: only ever record what the server confirmed (never our own not-yet-saved version)
+  const S = isOnline() ? remote : state;
+  if (!S || S.phase !== 'over' || !S.result || !S.white) return;
+  const rid = `${S.id}_${S.game}`;
+  const list = store.get('results') || [];
   if (list.some(r => r.rid === rid)) return;
-  const W = playerOf('w'), B = playerOf('b');
-  const r = state.result;
+  const side = col => S[col === 'w' ? S.white : (S.white === 'host' ? 'guest' : 'host')] || {};
+  const W = side('w'), B = side('b');
+  const r = S.result;
   const entry = {
-    rid, date: Date.now(), mode: state.mode,
+    rid, date: Date.now(), mode: S.mode, owner: myUid(), hostColor: S.white === 'host' ? 'w' : 'b',
     white: { name: W.name, rating: W.rating, uid: W.uid || null }, black: { name: B.name, rating: B.rating, uid: B.uid || null },
     gap: W.rating - B.rating, result: !r.winner ? 0.5 : r.winner === 'w' ? 1 : 0, reason: r.reason,
-    turns: state.turns, simCount: state.simCount, plies: state.moves.length,
-    targetWhite: state.sim?.plan?.targetWhite ?? null, jitter: state.sim?.plan?.jitter ?? 0,
-    positional: !!state.sim?.plan?.positional, evalWhite: state.sim?.evalWhite ?? null,
+    turns: S.turns, simCount: S.simCount, plies: S.moves.length, moves: S.moves.join(' '),
+    targetWhite: S.sim?.plan?.targetWhite ?? null, jitter: S.sim?.plan?.jitter ?? 0,
+    positional: !!S.sim?.plan?.positional, evalWhite: S.sim?.evalWhite ?? null,
   };
   list.push(entry);
   store.set('results', list.slice(-500));
-  onResultRecorded(entry);
+  uploadResult(entry);
 }
-function onResultRecorded() { /* replaced when online sync is available */ }
+async function uploadResult(entry) {
+  if (!myUid()) return;
+  try {
+    const r = await db.put(`results/${entry.rid}`, { ...entry, owner: entry.owner || myUid() }, NO_ETAG);
+    if (r.ok || r.status === 412 || r.status === 401) markSynced(entry.rid);   // 401/412: it's already there
+  } catch { /* offline: we'll try again next time */ }
+}
+function markSynced(rid) {
+  const list = store.get('results') || [];
+  const e = list.find(x => x.rid === rid);
+  if (e) { e.synced = true; store.set('results', list); }
+}
+// Upload results from games played offline (or before sign-in existed).
+async function syncResults() {
+  for (const e of (store.get('results') || []).filter(x => !x.synced).slice(0, 20)) await uploadResult(e);
+}
+async function loadResults() {
+  try {
+    const r = await db.get('results', '&orderBy=%22date%22&limitToLast=1000');
+    if (r.ok && r.val) remoteResults = Object.values(r.val).filter(Boolean);
+  } catch { /* offline */ }
+  return allResults();
+}
 
 function endGame(result) {
   if (state.clock?.since) {
     const t = chessFrom(state.moves).turn();
-    state.clock[t] = Math.max(0, state.clock[t] - (Date.now() - state.clock.since));
+    state.clock[t] = Math.max(0, state.clock[t] - (nowS() - state.clock.since));
     state.clock.since = null;
   }
   state.result = result;
@@ -590,7 +577,7 @@ function canMate(col, c) {
   return true;
 }
 
-function flag(color) {
+function flagNow(color) {
   if (state.phase !== 'playing') return;
   state.clock[color] = 0;
   state.clock.since = null;
@@ -600,7 +587,6 @@ function flag(color) {
     : { winner: null, reason: 'timeout vs insufficient material' };
   state.result = result;
   state.phase = 'over';
-  broadcast();
 }
 
 /* ---------- computer opponent ---------- */
@@ -658,12 +644,11 @@ async function botConsiderDraw() {
 }
 
 /* ---------- clocks ---------- */
-const hostNow = () => (role === 'guest' ? Date.now() + clockOffset : Date.now());
 function clockRemaining(color) {
   const c = state?.clock;
   if (!c) return null;
   let r = c[color];
-  if (c.since && state.phase === 'playing' && liveTurn === color) r -= hostNow() - c.since;
+  if (c.since && state.phase === 'playing' && liveTurn === color) r -= nowS() - c.since;
   return Math.max(0, r);
 }
 function fmtClock(ms) {
@@ -695,90 +680,274 @@ setInterval(() => {
     const ms = clockRemaining(liveTurn);
     if (ms != null && ms < 10000 && ms > 0 && Math.ceil(ms / 1000) !== lastTick) { lastTick = Math.ceil(ms / 1000); play('tick'); }
   }
-  // the host (or the single device in offline modes) decides when a flag falls
-  if (role === 'host' && state.phase === 'playing' && state.clock?.since) {
+  // when a clock runs out, either player's browser (or the single device offline) ends the game
+  if ((role === 'host' || role === 'guest') && state.phase === 'playing' && state.clock?.since) {
     const t = chessFrom(state.moves).turn();
-    if (state.clock[t] - (Date.now() - state.clock.since) <= 0) flag(t);
+    const late = nowS() - state.clock.since - state.clock[t];
+    const key = `${state.game}|${state.moves.length}`;
+    if (late >= (isOnline() ? 400 : 0) && flagTried !== key) {
+      flagTried = key;
+      setTimeout(() => { if (flagTried === key) flagTried = ''; }, 2000);
+      apply(() => {
+        if (state.phase !== 'playing' || !state.clock?.since) return;
+        const turn = chessFrom(state.moves).turn();
+        if (state.clock[turn] - (nowS() - state.clock.since) <= 0) flagNow(turn);
+      });
+    }
   }
+  if (isOnline() && Date.now() - connLabelAt > 10000) updateConnLabel();
 }, 100);
+let flagTried = '';
 
 /* ------------------------------------------------------------------ */
-/* Guest                                                               */
+/* Online play (Firebase Realtime Database, free plan)                 */
 /* ------------------------------------------------------------------ */
-function startGuest() {
-  role = 'guest';
-  const saved = store.get('guest:' + gameId);
-  guestToken = saved?.token || randId(16);
-  store.set('guest:' + gameId, { token: guestToken, ...(saved || {}) });
-  show('screen-join');
-  $('join-title').textContent = 'Connecting to your friend…';
-  $('join-sub').innerHTML = '<span class="muted"><span class="spinner"></span> Opening a direct connection</span>';
-  setConn('Connecting…');
+// Both players read and write the same game in the database. Every change is a
+// "compare-and-swap": it is only saved if nobody changed the game in the meantime;
+// otherwise we reload, re-apply the action and try again. So no tab has to stay open.
+const isOnline = () => state?.mode === 'online';
+const clone = o => JSON.parse(JSON.stringify(o));
+let remote = null;          // last known server copy of the game state
+let remoteEtag = null;      // its version tag (for compare-and-swap)
+let gameMeta = null;        // { hostUid, guestUid, presence }
+let commitQueue = Promise.resolve();
+let pending = 0;            // changes being saved right now
+let connStatus = 'off';
+let connLabelAt = 0;
+let stopListen = null;
+let presenceTimer = null;
 
-  makeGuestPeer();
+// Firebase drops empty lists and nulls; put the defaults back.
+function normalize(s) {
+  if (!s) return s;
+  s.moves = s.moves ? Object.values(s.moves) : [];
+  s.rematch = { host: false, guest: false, ...(s.rematch || {}) };
+  s.used = {
+    host: { hints: 0, takebacks: 0, ...(s.used?.host || {}) },
+    guest: { hints: 0, takebacks: 0, ...(s.used?.guest || {}) },
+  };
+  for (const k of ['result', 'drawOffer', 'sim', 'clock', 'replay', 'guest', 'white', 'lastTakeback', 'simLock', 'tc']) {
+    if (s[k] === undefined) s[k] = null;
+  }
+  if (s.replay) s.replay.moves = s.replay.moves ? Object.values(s.replay.moves) : [];
+  if (s.clock && s.clock.since === undefined) s.clock.since = null;
+  s.simCount = s.simCount || 0;
+  s.undos = s.undos || 0;
+  s.v = s.v || 0;
+  s.help = { hints: 0, takebacks: 0, ...(s.help || {}) };
+  return s;
 }
 
-function makeGuestPeer() {
-  const me = peer = new Peer(PEER_OPTS);
-  me.on('open', connectToHost);
-  me.on('disconnected', () => safeReconnect(me));
-  me.on('error', err => {
-    if (me !== peer) return;
-    if (!me.open && ['server-error', 'network', 'socket-error', 'socket-closed'].includes(err.type)) {
-      // couldn't reach the matchmaking server at all — start over in a moment
-      setConn('Can’t reach the server — retrying…', 'off');
-      me.destroy();
-      setTimeout(makeGuestPeer, 4000);
-    } else if (err.type === 'peer-unavailable') {
-      setConn('Host offline — retrying…', 'off');
-      if (!state) {
-        $('join-title').textContent = 'Your friend isn’t online right now';
-        $('join-sub').textContent = 'The game creator needs to keep their tab open. Retrying automatically…';
-      }
-      setTimeout(connectToHost, 4000);
-    } else {
-      console.warn('peer error', err);
+/** Change the game: offline right away; online saved to the database (see above). */
+function apply(fn) {
+  if (!isOnline()) { fn(); broadcast(); return Promise.resolve(); }
+  pending++;
+  const p = commitQueue.then(() => mutate(fn)).finally(() => { pending--; });
+  commitQueue = p.catch(() => {});
+  return p;
+}
+
+async function mutate(fn) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const base = clone(remote || state);
+    state = clone(base);
+    fn();
+    if (JSON.stringify(state) === JSON.stringify(base)) { render(); return; }   // nothing to save
+    state.v = (base.v || 0) + 1;
+    const working = clone(state);
+    render();                                    // show it right away
+    let r;
+    try {
+      r = await db.put(`games/${gameId}/state`, working, remoteEtag || NO_ETAG);
+    } catch {
+      connStatus = 'off'; updateConnLabel();
+      await sleep(1500);
+      continue;
     }
-  });
-}
-
-function safeReconnect(p) {
-  setTimeout(() => { if (p === peer && !p.destroyed && p.disconnected) p.reconnect(); }, 2000);
-}
-
-function connectToHost() {
-  if (conn && conn.open) return;
-  if (!peer || peer.destroyed || !peer.open) return;
-  const c = peer.connect(PEER_PREFIX + gameId, { reliable: true });
-  conn = c;
-  c.on('open', () => {
-    setConn('Connected', 'on');
-    c.send({ t: 'hello', token: guestToken });
-  });
-  c.on('data', msg => {
-    if (!msg) return;
-    if (msg.t === 'invite') showJoinForm(msg);
-    else if (msg.t === 'full') {
-      show('screen-join');
-      $('join-title').textContent = 'This game is already full';
-      $('join-sub').textContent = 'Two players are already in this game. Ask your friend for a new link.';
-      $('join-form').hidden = true;
-    } else if (msg.t === 'state') {
-      if (msg.now) clockOffset = msg.now - Date.now();
-      if (!state || msg.state.v >= state.v || msg.state.game !== state.game) state = msg.state;
-      if (state.host) setConn(`Connected to ${state.host.name}`, 'on');
+    if (r.ok) {
+      if (!remote || remote.v <= working.v) { remote = working; remoteEtag = r.etag; }
+      if (!pending || pending === 1) state = clone(remote);
       render();
+      afterChange();
+      return;
     }
-  });
-  c.on('close', () => {
-    if (conn === c) conn = null;
-    setConn('Disconnected — reconnecting…', 'off');
-    setTimeout(connectToHost, 2000);
-  });
+    if (r.status === 412) {                      // someone else changed it first: retry on top of theirs
+      remote = normalize(r.val);
+      remoteEtag = r.etag;
+      continue;
+    }
+    console.warn('save failed', r.status, r.val);
+    state = clone(remote || base);
+    uiNote = 'Couldn’t save that — check your internet connection.';
+    setTimeout(() => { uiNote = null; render(); }, 4000);
+    render();
+    return;
+  }
+}
+
+let etagTimer = null;
+function refreshEtagSoon() {
+  clearTimeout(etagTimer);
+  etagTimer = setTimeout(async () => {
+    try {
+      const r = await db.get(`games/${gameId}/state`);
+      if (r.ok && r.val) {
+        const s = normalize(r.val);
+        if (!remote || s.v >= remote.v) { remote = s; remoteEtag = r.etag; }
+      }
+    } catch { /* next change will sort it out */ }
+  }, 60);
+}
+
+function onGameValue(g) {
+  if (!g) return;
+  gameMeta = g;
+  const s = g.state ? normalize(clone(g.state)) : null;
+  if (role === 'joining') {
+    if (g.guestUid && g.guestUid !== myUid()) showFull();
+    else if (s && !$('join-form').querySelector('button').disabled) { remote = s; state = clone(s); }
+    return;
+  }
+  if (s && (!remote || s.v >= remote.v)) {
+    const changed = !remote || JSON.stringify(s) !== JSON.stringify(remote);
+    remote = s;
+    if (changed) { refreshEtagSoon(); if (!pending) state = clone(s); }
+  }
+  updateConnLabel();
+  if (role === 'host' || role === 'guest') { render(); afterChange(); }
+}
+
+// Jobs that whichever player is around should do.
+function afterChange() {
+  if (!isOnline() || !state) return;
+  if (state.phase === 'simulating' && !simulating) {
+    const lock = state.simLock;
+    if (!lock || lock.by === myUid() || nowS() - (lock.at || 0) > 25000) runSimulation();
+  }
+  if (state.phase === 'over') recordResult();
+}
+
+function updateConnLabel() {
+  connLabelAt = Date.now();
+  if (!isOnline() || (role !== 'host' && role !== 'guest')) return;
+  if (connStatus !== 'on') { setConn('Reconnecting…', 'off'); return; }
+  if (!state?.guest) { setConn('Online', 'on'); return; }
+  const opp = role === 'host' ? 'guest' : 'host';
+  const seen = gameMeta?.presence?.[opp];
+  const name = state[opp]?.name || 'Friend';
+  if (seen && nowS() - seen < 50000) setConn(`${name} is online`, 'on');
+  else setConn(`${name} is away`, '');
+}
+
+function startPresence() {
+  if (presenceTimer || (role !== 'host' && role !== 'guest')) return;
+  const beat = () => db.put(`games/${gameId}/presence/${role}`, TIMESTAMP).catch(() => {});
+  beat();
+  presenceTimer = setInterval(beat, 20000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) beat(); });
+}
+
+function rememberGame() {
+  const list = (store.get('myOnlineGames') || []).filter(g => g.id !== gameId);
+  list.unshift({ id: gameId, date: Date.now() });
+  store.set('myOnlineGames', list.slice(0, 15));
+}
+
+// Reserve a nickname and save the profile (best effort: never blocks playing when offline).
+async function claimName(name, rating) {
+  const key = name.toLowerCase().replace(/[.#$\[\]\/\s]+/g, ' ').trim();
+  try {
+    await signIn();
+    if (key) {
+      const path = `names/${encodeURIComponent(key)}`;
+      const r = await db.put(path, myUid(), NO_ETAG);
+      if (!r.ok) {
+        const owner = (await db.get(path)).val;
+        if (owner && owner !== myUid()) return `Someone else already uses the nickname “${name}”. Add a letter or pick another.`;
+      }
+    }
+    await db.patch(`users/${myUid()}`, { name, rating, updated: TIMESTAMP });
+  } catch { /* offline: fine */ }
+  return null;
+}
+
+async function createOnline(name, rating) {
+  const btnEl = $('create-btn');
+  const err = $('create-error');
+  btnEl.disabled = true;
+  err.hidden = true;
+  const fail = msg => { err.textContent = msg; err.hidden = false; btnEl.disabled = false; state = null; role = null; };
+  try { await signIn(); } catch { return fail('Can’t reach the game server. Check your internet connection and try again.'); }
+  const taken = await claimName(name, rating);
+  if (taken) return fail(taken);
+  state.host.uid = myUid();
+  state.v = 1;
+  let r;
+  try { r = await db.put(`games/${gameId}`, { hostUid: myUid(), created: TIMESTAMP, state }, NO_ETAG); }
+  catch { return fail('Can’t reach the game server. Check your internet connection and try again.'); }
+  if (!r.ok) return fail('Couldn’t create the game. Please try again.');
+  btnEl.disabled = false;
+  history.replaceState(null, '', `?game=${gameId}${FBQ}`);
+  rememberGame();
+  startOnline();
+}
+
+async function startOnline() {
+  show('screen-join');
+  $('join-form').hidden = true;
+  $('join-title').textContent = 'Connecting…';
+  $('join-sub').innerHTML = '<span class="muted"><span class="spinner"></span> Loading the game</span>';
+  setConn('Connecting…');
+  let r;
+  try {
+    await signIn();
+    r = await db.get(`games/${gameId}`);
+  } catch {
+    $('join-title').textContent = 'Can’t reach the game server';
+    $('join-sub').textContent = 'Check your internet connection. Retrying…';
+    setConn('Offline', 'off');
+    setTimeout(startOnline, 4000);
+    return;
+  }
+  if (!r.ok || !r.val || !r.val.state) {
+    $('join-title').textContent = 'Game not found';
+    $('join-sub').textContent = 'Check the link, or ask your friend to send a new one.';
+    setConn('', '');
+    return;
+  }
+  syncClock().catch(() => {});
+  gameMeta = r.val;
+  remote = normalize(clone(r.val.state));
+  state = clone(remote);
+  const uid = myUid();
+  role = gameMeta.hostUid === uid ? 'host' : gameMeta.guestUid === uid ? 'guest' : !gameMeta.guestUid ? 'joining' : 'full';
+  refreshEtagSoon();
+  if (role === 'full') { showFull(); return; }
+  stopListen?.();
+  stopListen = listen(`games/${gameId}`, onGameValue, st => { connStatus = st === 'on' ? 'on' : 'off'; updateConnLabel(); });
+  if (role === 'joining') { showJoinForm(state); return; }
+  rememberGame();
+  connStatus = 'on';
+  startPresence();
+  getEngine();
+  render();
+  updateConnLabel();
+  afterChange();
+}
+
+function showFull() {
+  role = 'full';
+  stopListen?.();
+  show('screen-join');
+  $('join-title').textContent = 'This game is already full';
+  $('join-sub').textContent = 'Two players are already in this game. Ask your friend for a new link.';
+  $('join-form').hidden = true;
+  setConn('', '');
 }
 
 function showJoinForm(inv) {
   show('screen-join');
+  setConn('', '');
   $('join-title').textContent = `${inv.host.name} (${inv.host.rating}) invited you`;
   $('join-sub').textContent = inv.turns > 0
     ? `The engine plays the first ${inv.turns} moves (${styleLabel(inv.style ?? 25).toLowerCase()} opening style), tilted toward the lower-rated player. Then it’s your game.`
@@ -789,13 +958,31 @@ function showJoinForm(inv) {
   f.hidden = false;
   if (profile.name) f.name.value = profile.name;
   if (profile.rating) f.rating.value = profile.rating;
-  f.onsubmit = e => {
+  const err = $('join-error');
+  f.onsubmit = async e => {
     e.preventDefault();
-    const name = f.name.value.trim() || 'Friend';
-    const rating = Math.round(+f.rating.value) || 1200;
+    const name = f.name.value.trim().slice(0, 20) || 'Friend';
+    const rating = Math.max(100, Math.min(3500, Math.round(+f.rating.value) || 1200));
     store.set('profile', { ...profile, name, rating });
-    f.querySelector('button').disabled = true;
-    conn.send({ t: 'join', name, rating, token: guestToken });
+    const b = f.querySelector('button');
+    b.disabled = true;
+    err.hidden = true;
+    const taken = await claimName(name, rating);
+    if (taken) { err.textContent = taken; err.hidden = false; b.disabled = false; return; }
+    let r;
+    try { r = await db.put(`games/${gameId}/guestUid`, myUid(), NO_ETAG); }
+    catch { err.textContent = 'Can’t reach the game server. Try again.'; err.hidden = false; b.disabled = false; return; }
+    if (!r.ok && r.val !== myUid()) { showFull(); return; }
+    role = 'guest';
+    rememberGame();
+    startPresence();
+    getEngine();
+    await apply(() => {
+      if (state.guest) return;
+      state.guest = { name, rating, uid: myUid() };
+      startGame(pickWhite());
+    });
+    b.disabled = false;
   };
 }
 
@@ -805,8 +992,9 @@ function showJoinForm(inv) {
 const whoOf = col => (col === 'w' ? state.white : (state.white === 'host' ? 'guest' : 'host'));
 
 function act(msg) {
-  if (role === 'host') actOn(state.mode === 'local' ? whoOf(chessFrom(state.moves).turn()) : 'host', msg);
-  else if (conn && conn.open) conn.send(msg);
+  if (!isOnline()) { actOn(state.mode === 'local' ? whoOf(chessFrom(state.moves).turn()) : 'host', msg); return; }
+  if (role !== 'host' && role !== 'guest') return;
+  apply(() => actOn(role, msg));
 }
 
 function myColor() {
@@ -818,18 +1006,6 @@ function myColor() {
 function playMove(from, to, promotion) {
   const n = state.moves.length;
   const move = { from, to, promotion };
-  if (role === 'guest') {
-    // optimistic local update; the host's state will confirm it
-    const c = chessFrom(state.moves);
-    try {
-      const m = c.move(move);
-      state.moves.push(m.san);
-      state.drawOffer = null;
-      const r = resultOf(c);
-      if (r) { state.result = r; state.phase = 'over'; }
-    } catch { /* illegal; host will resync */ }
-    render();
-  }
   act({ t: 'move', move, n });
 }
 
@@ -1615,8 +1791,6 @@ async function requestHint() {
   if (live.turn() !== mine || helpLeft(whoOf(mine), 'hints') <= 0) return;
   const game = state.game, n = state.moves.length, undos = state.undos || 0, fen = live.fen();
   hintBusy = true;
-  // count it right away (the guest updates locally too; the host's state confirms)
-  if (role === 'guest') state.used[whoOf(mine)].hints++;
   act({ t: 'hint', n });
   render();
   try {
@@ -1670,7 +1844,7 @@ function renderOverlay(mine) {
   const info = document.createElement('p');
   info.textContent = online && themReq && !meReq ? `Your friend wants a rematch with a ${kind}!` : 'Colors swap for the next game.';
   const close = btn('View board', 'ghost', () => { ov.dataset.dismissed = `${state.game}`; ov.hidden = true; });
-  const fresh = btn('New game', 'ghost', () => { location.href = location.pathname + (SIGNAL ? `?signal=${SIGNAL}` : ''); });
+  const fresh = btn('New game', 'ghost', () => { location.href = location.pathname + (FBQ ? `?${FBQ.slice(1)}` : ''); });
   const rv = btn('📊 Review game', '', () => { ov.dataset.dismissed = `${state.game}`; ov.hidden = true; openReview(); });
   box.append(h, p, info, rb, same, rv, close, fresh);
   ov.appendChild(box);
@@ -1678,7 +1852,7 @@ function renderOverlay(mine) {
 
 function renderWait() {
   show('screen-wait');
-  const link = location.origin + location.pathname + `?game=${gameId}` + (SIGNAL ? `&signal=${SIGNAL}` : '');
+  const link = location.origin + location.pathname + `?game=${gameId}${FBQ}`;
   $('share-link').value = link;
   $('copy-link').onclick = async () => {
     try { await navigator.clipboard.writeText(link); }
@@ -1755,6 +1929,121 @@ function toast(text, ms = 3500) {
   document.body.appendChild(t);
   setTimeout(() => t.remove(), ms);
 }
+/* ------------------------------------------------------------------ */
+/* Profile, unfinished games, scoreboard                               */
+/* ------------------------------------------------------------------ */
+const esc = t => String(t ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtDate = t => new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+
+// All results that are mine: everything saved on this device, plus my online games from other devices.
+function myResults() {
+  const local = store.get('results') || [];
+  const ids = new Set(local.map(r => r.rid));
+  const uid = myUid();
+  return [...local, ...myGames(remoteResults, uid).filter(r => !ids.has(r.rid))];
+}
+
+async function renderMeCard() {
+  const card = $('me-card');
+  if (!card) return;
+  const name = profile.name;
+  const me = myUid() ? skipRatings(allResults()).get(myUid()) : null;
+  card.hidden = false;
+  card.innerHTML = name
+    ? `<span aria-hidden="true">👤</span><span><span class="me-name">${esc(name)}</span>
+        <span class="me-stats">${me ? ` · Skip rating ${me.rating} · ${me.w}W ${me.d}D ${me.l}L` : ' · your games are saved on this device'}</span></span>`
+    : `<span aria-hidden="true">👤</span><span class="me-stats">Pick a nickname below. It saves your games and puts you on the scoreboard.</span>`;
+  const b = btn('🏆 Scoreboard', 'ghost', () => openScores());
+  card.appendChild(b);
+  if (me && profile.rating !== me.rating && $('create-form').rating.value == profile.rating) {
+    $('create-form').rating.value = me.rating;     // suggest your Skip rating for the next game
+  }
+}
+
+async function renderResume() {
+  const box = $('resume');
+  const list = (store.get('myOnlineGames') || []).slice(0, 6);
+  if (!box || !list.length || !navigator.onLine) return;
+  const open = [];
+  await Promise.all(list.map(async g => {
+    try {
+      const r = await db.get(`games/${g.id}/state`);
+      const s = r.ok && r.val;
+      if (s && s.phase !== 'over') open.push({ ...g, s });
+    } catch { /* skip */ }
+  }));
+  if (!open.length) return;
+  open.sort((a, b) => b.date - a.date);
+  box.innerHTML = '<h3>Continue a game</h3>' + open.map(g => {
+    const mineHost = g.s.host?.uid === myUid();
+    const opp = mineHost ? g.s.guest?.name : g.s.host?.name;
+    const label = !g.s.guest ? 'Waiting for a friend to join' : `vs ${esc(opp || 'Friend')}`;
+    return `<a href="?game=${encodeURIComponent(g.id)}${FBQ}">${label}<span>${fmtDate(g.date)} →</span></a>`;
+  }).join('');
+  box.hidden = false;
+}
+
+let scoresFrom = null;
+async function openScores() {
+  if (!$('screen-scores').hidden) return;
+  scoresFrom = [...document.querySelectorAll('main > section')].find(x => !x.hidden)?.id || 'screen-create';
+  show('screen-scores');
+  $('scores-body').innerHTML = '<p class="sc-empty"><span class="spinner"></span></p>';
+  try { await signIn(); } catch { /* offline: local results only */ }
+  await loadResults();
+  renderScores();
+}
+function closeScores() { show(scoresFrom || 'screen-create'); }
+
+function renderScores() {
+  const tab = document.querySelector('input[name=scores-tab]:checked')?.value || 'players';
+  const body = $('scores-body');
+  const uid = myUid();
+  if (tab === 'players') {
+    const players = [...skipRatings(allResults()).values()].sort((a, b) => b.rating - a.rating);
+    const h2h = uid ? headToHead(allResults(), uid) : [];
+    let html = `<p class="sc-note">Everyone who played online with a link. Your <b>Skip rating</b> starts at the rating you entered and moves after every game.
+      When the opening gave the weaker player a head start, a game counts as 50/50 — so beating a stronger friend still earns points.</p>`;
+    if (!players.length) html += '<p class="sc-empty">No online games yet. Create a game, send the link to a friend, and you’ll both appear here.</p>';
+    else {
+      html += `<table class="sc-table"><thead><tr><th class="sc-rank">#</th><th>Player</th><th class="num">Skip rating</th><th class="num">Games</th><th class="num sc-hide-m">W / D / L</th></tr></thead><tbody>`;
+      players.forEach((p, i) => {
+        const ch = p.change ? `<span class="${p.change > 0 ? 'sc-up' : 'sc-down'}">${p.change > 0 ? '▲' : '▼'}${Math.abs(p.change)}</span>` : '';
+        html += `<tr class="${p.uid === uid ? 'me' : ''}"><td class="sc-rank">${i + 1}</td><td>${esc(p.name)}${p.uid === uid ? ' (you)' : ''}</td>
+          <td class="num">${p.rating}${ch}</td><td class="num">${p.games}</td><td class="num sc-hide-m">${p.w} / ${p.d} / ${p.l}</td></tr>`;
+      });
+      html += '</tbody></table>';
+    }
+    if (h2h.length) {
+      html += `<h3>You vs your friends</h3><table class="sc-table"><thead><tr><th>Friend</th><th class="num">Games</th><th class="num">You won</th><th class="num">Draws</th><th class="num">They won</th></tr></thead><tbody>`;
+      for (const o of h2h) html += `<tr><td>${esc(o.name)}</td><td class="num">${o.games}</td><td class="num">${o.w}</td><td class="num">${o.d}</td><td class="num">${o.l}</td></tr>`;
+      html += '</tbody></table>';
+    }
+    body.innerHTML = html;
+  } else {
+    const games = myResults().sort((a, b) => (b.date || 0) - (a.date || 0)).slice(0, 60);
+    if (!games.length) { body.innerHTML = '<p class="sc-empty">No finished games yet.</p>'; return; }
+    body.innerHTML = games.map(r => {
+      const meWhite = r.white?.uid || r.black?.uid ? r.white?.uid === uid : (r.hostColor || 'w') === 'w';
+      const me = meWhite ? r.white : r.black, opp = meWhite ? r.black : r.white;
+      const score = meWhite ? r.result : 1 - r.result;
+      const cls = score === 1 ? 'win' : score === 0 ? 'loss' : 'draw';
+      const word = r.mode === 'local' ? (r.result === 1 ? '1–0' : r.result === 0 ? '0–1' : '½–½') : score === 1 ? 'Won' : score === 0 ? 'Lost' : 'Draw';
+      const icon = r.mode === 'bot' ? '🤖' : r.mode === 'local' ? '👥' : '🌐';
+      const who = r.mode === 'local' ? `${esc(r.white?.name)} vs ${esc(r.black?.name)}` : `vs ${esc(opp?.name)} (${opp?.rating ?? '?'})`;
+      const moves = r.moves ? r.moves.split(' ') : [];
+      const link = moves.length ? `<a href="${lichessPgnUrl(moves)}" target="_blank" rel="noopener">Analyse ↗</a>` : '<span></span>';
+      const details = [`${fmtDate(r.date)}`, r.mode === 'local' ? 'same device' : `you had ${meWhite ? 'White' : 'Black'}`,
+        r.reason ? `by ${r.reason}` : '', r.turns ? `${r.simCount || r.turns} opening moves by the engine` : 'normal start'].filter(Boolean).join(' · ');
+      return `<div class="sc-game"><span class="sc-res ${r.mode === 'local' ? 'draw' : cls}">${word}</span><span>${icon} ${who}</span>${link}<span class="sub">${esc(details)}</span></div>`;
+    }).join('');
+  }
+}
+
+$('scores-btn').onclick = () => openScores();
+$('scores-back').onclick = () => closeScores();
+for (const r of document.querySelectorAll('input[name=scores-tab]')) r.addEventListener('change', renderScores);
+
 function syncOnline() {
   const f = $('create-form');
   const offline = !navigator.onLine;
@@ -1771,22 +2060,28 @@ if (!gameId) {
   initCreate();
 } else {
   const hosted = store.get('host:' + gameId);
-  if (hosted) {
+  if (hosted && hosted.mode && hosted.mode !== 'online') {
+    // a computer or same-device game kept on this device
     role = 'host';
     state = hosted;
-    state.mode = state.mode || 'online';
     render();
-    if (state.phase === 'simulating' || !state.guest) getEngine();
-    if (state.mode === 'online') startHost();
-    else {
-      setConn(state.mode === 'bot' ? 'vs computer' : 'Same device', 'on');
-      if (state.phase === 'simulating') runSimulation();
-      maybeBotMove();
-    }
+    if (state.phase === 'simulating') getEngine();
+    setConn(state.mode === 'bot' ? 'vs computer' : 'Same device', 'on');
+    if (state.phase === 'simulating') runSimulation();
+    maybeBotMove();
   } else {
-    startGuest();
+    startOnline();
   }
+}
+// Sign in quietly in the background and share any results not uploaded yet.
+if (!gameId) renderMeCard();
+if (navigator.onLine) {
+  signIn().then(async () => {
+    syncResults();
+    await loadResults();
+    if (!gameId) { renderMeCard(); renderResume(); }
+  }).catch(() => {});
 }
 
 // exposed for debugging / tests
-window.__skip = { get state() { return state; }, get role() { return role; }, targetAdvantage, play: (f, t, pr) => playMove(f, t, pr) };
+window.__skip = { get state() { return state; }, get role() { return role; }, targetAdvantage, play: (f, t, pr) => playMove(f, t, pr), myUid, allResults };

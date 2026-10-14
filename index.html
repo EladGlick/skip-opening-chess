@@ -26,6 +26,7 @@
     <div class="top-right">
       <button class="btn ghost install" id="install-btn" type="button" hidden>⬇ Install app</button>
       <span class="conn" id="conn" hidden></span>
+      <button class="icon-btn" id="scores-btn" type="button" title="Scoreboard &amp; my games" aria-label="Scoreboard and my games">🏆</button>
       <button class="icon-btn" id="settings-btn" type="button" title="Settings" aria-label="Settings" aria-expanded="false">⚙️</button>
     </div>
     <div class="settings" id="settings" hidden>
@@ -58,6 +59,9 @@
         <p class="lead">The engine plays the first moves. If ratings differ, the opening tilts toward the
           lower-rated player, so the game is fair from move one.</p>
       </div>
+
+      <div class="me-card" id="me-card" hidden></div>
+      <div class="resume" id="resume" hidden></div>
 
       <form id="create-form" class="form" novalidate>
         <div class="modes" role="radiogroup" aria-label="How do you want to play?">
@@ -223,8 +227,22 @@
         </fieldset>
 
         <p class="offline-note" id="offline-note" hidden>📴 You're offline. Playing a friend online needs internet; <b>Computer</b> and <b>Same device</b> work offline.</p>
+        <p class="form-error" id="create-error" role="alert" hidden></p>
         <button class="btn primary big" type="submit" id="create-btn">Create game &amp; get link</button>
       </form>
+    </section>
+
+    <!-- Scoreboard and my games -->
+    <section class="card scores" id="screen-scores" hidden>
+      <div class="scores-head">
+        <button class="btn ghost" id="scores-back" type="button">← Back</button>
+        <h2>🏆 Scoreboard</h2>
+      </div>
+      <div class="seg seg2 scores-tabs" role="tablist">
+        <label><input type="radio" name="scores-tab" value="players" checked><span>Players</span></label>
+        <label><input type="radio" name="scores-tab" value="games"><span>My games</span></label>
+      </div>
+      <div id="scores-body" class="scores-body"></div>
     </section>
 
     <!-- Waiting for the friend -->
@@ -237,7 +255,7 @@
         <button class="btn primary" id="copy-link" type="button">Copy</button>
       </div>
       <button class="btn ghost wide" id="native-share" type="button" hidden>Share…</button>
-      <p class="muted"><span class="spinner"></span> Waiting for your friend. Keep this tab open.</p>
+      <p class="muted"><span class="spinner"></span> Waiting for your friend. You can close this page — open the same link later to come back.</p>
     </section>
 
     <!-- Join a game -->
@@ -253,6 +271,7 @@
             <input name="rating" type="number" inputmode="numeric" min="100" max="3500" step="1" value="1200">
           </label>
         </div>
+        <p class="form-error" id="join-error" role="alert" hidden></p>
         <button class="btn primary big" type="submit">Join game</button>
       </form>
     </section>
@@ -312,7 +331,6 @@
 
   <footer class="foot">Opening engine: Stockfish (GPLv3) · Board: chessground (GPLv3) · Opening names: Lichess chess-openings (CC0)</footer>
 
-  <script src="vendor/peerjs.min.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

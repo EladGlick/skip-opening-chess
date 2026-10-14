@@ -10,7 +10,7 @@ Three ways to play: **🌐 online with a friend** (send a link), **🤖 against 
 
 1. Enter your name and rating, choose how many moves to simulate (0–20), the **opening style**
    (Classic → Mainstream → Offbeat → Wild → Crazy) and your color.
-2. Send the link to your friend. They enter their name and rating.
+2. Send the link to your friend. They enter their name and rating. (Online games and the 🏆 scoreboard use your nickname.)
 3. Stockfish plays the first moves for both sides. If you're rated differently, the opening is
    tilted toward the lower-rated player. It starts at ~1 pawn per 200 rating points (max 4.5 pawns) and
    **learns from your results**: if the lower-rated player keeps losing, the edge grows; if they keep
@@ -35,9 +35,16 @@ Add to Home Screen. After the first visit, vs-computer and same-device games wor
 ## How it works
 
 - **Pure static site** — runs on GitHub Pages, no server of our own.
-- **Online play**: a direct browser-to-browser connection (WebRTC) using [PeerJS](https://peerjs.com).
-  The free PeerJS cloud server only introduces the two browsers. The game creator's tab
-  holds the game, so keep it open; either player can refresh and reconnect.
+- **Online play**: the game lives in a [Firebase Realtime Database](https://firebase.google.com/docs/database)
+  on the free Spark plan (no billing account attached, so it can't cost money). The app talks to it
+  through Firebase's plain web (REST) interface: no SDK, no server of our own. Both players read and
+  write the same game; every change is a compare-and-swap, so simultaneous actions can't clash.
+  Nobody has to keep a tab open — close it and open the link again to come back.
+- **Sign-in**: just a nickname. Behind the scenes each browser gets a free anonymous Firebase account,
+  which remembers your games on that device.
+- **Scoreboard** (🏆): every online result is shared, so the handicap learns from everyone's games.
+  Each player gets a *Skip rating* that starts at the rating they entered; a game with a handicap
+  counts as 50/50, so beating a stronger friend still earns points.
 - **Computer opponent**: a second Stockfish instance. From 1400 up it uses Stockfish's own
   `UCI_Elo` limiter; below that it picks randomly among its top candidate moves, with more
   randomness for lower ratings.
@@ -60,7 +67,7 @@ python3 -m http.server 8000
 
 ## Ideas for later
 
-Server-backed online games (Firebase), nickname sign-in with game history and a friends scoreboard, chat.
+Chat / emoji, signing in on a second device, a manual handicap override.
 
 ## License
 
