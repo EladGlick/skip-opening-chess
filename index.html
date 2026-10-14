@@ -26,6 +26,27 @@
     <div class="top-right">
       <button class="btn ghost install" id="install-btn" type="button" hidden>⬇ Install app</button>
       <span class="conn" id="conn" hidden></span>
+      <button class="icon-btn" id="settings-btn" type="button" title="Settings" aria-label="Settings" aria-expanded="false">⚙️</button>
+    </div>
+    <div class="settings" id="settings" hidden>
+      <div class="set-row"><span>Sound</span><label class="switch"><input type="checkbox" id="pref-sound"><span></span></label></div>
+      <div class="set-row"><span>Premoves</span><label class="switch"><input type="checkbox" id="pref-premove"><span></span></label></div>
+      <div class="set-row col"><span>Theme</span>
+        <div class="seg seg3" role="radiogroup" aria-label="Theme">
+          <label><input type="radio" name="pref-theme" value="auto"><span>Auto</span></label>
+          <label><input type="radio" name="pref-theme" value="dark"><span>Dark</span></label>
+          <label><input type="radio" name="pref-theme" value="light"><span>Light</span></label>
+        </div>
+      </div>
+      <div class="set-row col"><span>Board</span>
+        <div class="swatches" id="pref-board">
+          <button type="button" data-board="green" title="Green"></button>
+          <button type="button" data-board="brown" title="Brown"></button>
+          <button type="button" data-board="blue" title="Blue"></button>
+          <button type="button" data-board="gray" title="Gray"></button>
+          <button type="button" data-board="purple" title="Purple"></button>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -260,6 +281,10 @@
               <div class="handicap" id="handicap" hidden></div>
               <div id="learn-body"></div>
             </div>
+          </div>
+          <div class="sec review-sec" id="review-sec" hidden>
+            <button type="button" class="sec-head" aria-expanded="false"><span class="sec-title">📊 Game review</span><span class="sec-sub" id="review-sub"></span></button>
+            <div class="sec-body review-body" id="review-body"></div>
           </div>
           <div class="sec moves-sec open" id="moves-sec">
             <button type="button" class="sec-head" aria-expanded="true"><span class="sec-title">Moves</span><span class="sec-sub" id="moves-sub"></span></button>

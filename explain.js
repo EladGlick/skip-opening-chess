@@ -66,7 +66,11 @@ const pawns = cp => {
  * @param {{lines: Array<{uci,score,pv}>, threat: ?{uci,score,pv,fen}}} analysis
  * @returns {{san:string, from:string, to:string, reasons:string[], line:string, verdict:string}}
  */
-export function explainHint(fen, { lines, threat, follow }) {
+export function explainHint(fen, { lines, threat, follow }, voice = 'you') {
+  // voice 'you': the hint-taker's move. voice 'they': the opponent's move, told to you.
+  const T = voice === 'they'
+    ? { you: 'they', your: 'their', Your: 'Their', They: 'You', their: 'your', opp: 'you', oppS: 'your', has: 'have' }
+    : { you: 'you', your: 'your', Your: 'Your', They: 'They', their: 'their', opp: 'your opponent', oppS: 'your opponent’s', has: 'has' };
   const best = lines[0];
   const me = fen.split(' ')[1];
   const opp = me === 'w' ? 'b' : 'w';
@@ -79,7 +83,7 @@ export function explainHint(fen, { lines, threat, follow }) {
 
   // 1. Forced mate
   if (best.score > MATE - 200) {
-    const n = Math.ceil((MATE - best.score) / 2);
+    const n = MATE - best.score;            // moves until mate, counting this one
     add(n <= 1 ? 'It’s checkmate!' : `It starts a forced checkmate in ${n} moves.`);
   }
 
@@ -107,7 +111,7 @@ export function explainHint(fen, { lines, threat, follow }) {
     if (best.score < 100 * (balance + gain) - 60) gain = 0;
     if (gain >= 2) {
       const what = gain >= 8 ? 'a queen' : gain >= 5 ? 'a rook' : gain >= 3 ? 'a piece' : `${gain} pawns`;
-      add(`It wins material: after the exchanges you gain about ${what}.`);
+      add(`It wins material: after the exchanges ${T.you} gain about ${what}.`);
     } else if (gain === 1) add('It wins a pawn.');
   }
 
@@ -124,17 +128,17 @@ export function explainHint(fen, { lines, threat, follow }) {
 
   // 3. What the move itself does
   if (/[kq]/.test(m.flags)) {
-    add('Castling tucks your king into safety and brings the rook into the game.');
+    add(`Castling tucks ${T.your} king into safety and brings the rook into the game.`);
   }
   if (m.captured && !reasons.some(r => r.includes('material'))) {
     const giveBack = after.attackers(m.to, opp).length > 0 && VALUE[moving.type] > VALUE[m.captured];
     add(giveBack
-      ? `It takes the ${NAME[m.captured]} on ${m.to}. They can take your ${NAME[moving.type]}, but what follows makes it worth it.`
+      ? `It takes the ${NAME[m.captured]} on ${m.to}. ${T.They} can take ${T.your} ${NAME[moving.type]}, but what follows makes it worth it.`
       : `It captures the ${NAME[m.captured]} on ${m.to}.`);
   }
   if (m.promotion) add(`The pawn promotes to ${article(NAME[m.promotion])}.`);
   if (after.isCheckmate()) add('It’s checkmate!');
-  else if (after.inCheck()) add('It comes with check, so your opponent has to react.');
+  else if (after.inCheck()) add(`It comes with check, so ${T.opp} ${T.has} to react.`);
 
   // 4. Saving a piece that was in danger
   const danger = hanging(before, me);
@@ -142,8 +146,8 @@ export function explainHint(fen, { lines, threat, follow }) {
     const nowSafe = danger.filter(p => !hanging(after, me).some(q => q.square === (p.square === m.from ? m.to : p.square)));
     const big = nowSafe.sort((a, b) => VALUE[b.type] - VALUE[a.type])[0];
     if (big) add(big.square === m.from
-      ? `Your ${NAME[big.type]} on ${big.square} was under attack — this moves it to safety.`
-      : `It protects your ${NAME[big.type]} on ${big.square}, which was under attack.`);
+      ? `${T.Your} ${NAME[big.type]} on ${big.square} was under attack — this moves it to safety.`
+      : `It protects ${T.your} ${NAME[big.type]} on ${big.square}, which was under attack.`);
   }
 
   // 5. Stopping the opponent's threat (what they'd do if it were their move)
@@ -155,8 +159,8 @@ export function explainHint(fen, { lines, threat, follow }) {
     const real = tm && (tm.captured || tc.isCheckmate() || tc.inCheck());
     if (real && threatGain > 150 && tm.to !== m.to) {
       const what = tc.isCheckmate() ? `checkmate with ${tm.san}`
-        : tm.captured ? `${tm.san}, taking your ${NAME[tm.captured]}` : `${tm.san} (a dangerous check)`;
-      add(`It stops your opponent’s threat of ${what}.`);
+        : tm.captured ? `${tm.san}, taking ${T.your} ${NAME[tm.captured]}` : `${tm.san} (a dangerous check)`;
+      add(`It stops ${T.oppS} threat of ${what}.`);
     }
   }
 
@@ -171,7 +175,7 @@ export function explainHint(fen, { lines, threat, follow }) {
       if (sq.type === 'k' || !defended || VALUE[sq.type] > VALUE[moving.type]) targets.push(sq);
     }
     const named = targets.filter(t => t.type !== 'k');
-    if (targets.length >= 2) add(`Fork! Your ${NAME[moving.type]} attacks ${targets.length} things at once (${targets.map(t => t.type === 'k' ? 'the king' : `the ${NAME[t.type]}`).join(' and ')}).`);
+    if (targets.length >= 2) add(`Fork! ${T.Your} ${NAME[moving.type]} attacks ${targets.length} things at once (${targets.map(t => t.type === 'k' ? 'the king' : `the ${NAME[t.type]}`).join(' and ')}).`);
     else if (named.length === 1) add(`It attacks the ${NAME[named[0].type]} on ${named[0].square}.`);
   }
 
@@ -179,15 +183,15 @@ export function explainHint(fen, { lines, threat, follow }) {
   const moveNo = +fen.split(' ')[5];
   if (reasons.length < 2 && moveNo <= 15) {
     const backRank = me === 'w' ? '1' : '8';
-    if ((moving.type === 'n' || moving.type === 'b') && m.from[1] === backRank) add(`It develops your ${NAME[moving.type]} so it joins the fight.`);
+    if ((moving.type === 'n' || moving.type === 'b') && m.from[1] === backRank) add(`It develops ${T.your} ${NAME[moving.type]} so it joins the fight.`);
     else if (moving.type === 'p' && !m.captured && CENTER.has(m.to)) add('It grabs space in the center of the board.');
   }
 
   // 8. The plan: the engine's expected continuation
   const { sans } = playLine(fen, best.pv, 4);
   const line = sans.length > 1 ? lineText(fen, sans) : '';
-  if (reasons.length < 3 && sans.length >= 3) add(`It prepares ${sans[2]} as your next move.`);
-  if (!reasons.length) add('It improves your position more than any other move, even if there’s no immediate tactic.');
+  if (reasons.length < 3 && sans.length >= 3) add(`It prepares ${sans[2]} as ${T.your} next move.`);
+  if (!reasons.length) add(`It improves ${T.your} position more than any other move, even if there’s no immediate tactic.`);
 
   // Verdict: how good, and how unique
   let verdict;

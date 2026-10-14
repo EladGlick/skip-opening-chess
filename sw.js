@@ -5,7 +5,7 @@
 //  - Our own code (html/js/css/manifest): network-first, so updates show up right away
 //    when online, with the cached copy as the offline fallback.
 //  - Third-party data (Lichess opening names, Google Fonts): stale-while-revalidate.
-const VERSION = 'v2';
+const VERSION = 'v3';
 const CORE = `core-${VERSION}`;
 const RUNTIME = `runtime-${VERSION}`;
 
@@ -22,7 +22,7 @@ const VENDOR = [
   'icons/maskable-512.png',
   'icons/apple-touch-icon.png',
 ];
-const APP = ['./', 'index.html', 'app.js', 'engine.js', 'explain.js', 'openings.js', 'style.css', 'manifest.webmanifest'];
+const APP = ['./', 'index.html', 'app.js', 'engine.js', 'explain.js', 'review.js', 'handicap.js', 'sound.js', 'openings.js', 'style.css', 'manifest.webmanifest'];
 const OPENINGS = 'https://raw.githubusercontent.com/lichess-org/chess-openings/a6189a30dc273ccb21fc2536a9a2fefd5592a67a/';
 const EXTRA = [...'abcde'].map(x => `${OPENINGS}${x}.tsv`);
 

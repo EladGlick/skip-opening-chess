@@ -12,15 +12,22 @@ Three ways to play: **🌐 online with a friend** (send a link), **🤖 against 
    (Classic → Mainstream → Offbeat → Wild → Crazy) and your color.
 2. Send the link to your friend. They enter their name and rating.
 3. Stockfish plays the first moves for both sides. If you're rated differently, the opening is
-   tilted toward the lower-rated player (~1 pawn of advantage per 200 rating points, max 4 pawns;
-   gaps under 50 points get a fair opening).
+   tilted toward the lower-rated player. It starts at ~1 pawn per 200 rating points (max 4.5 pawns) and
+   **learns from your results**: if the lower-rated player keeps losing, the edge grows; if they keep
+   winning, it shrinks. Half the games give a **positional** edge (no material handed over), and every
+   game adds a **🎲 random bonus** of up to 0.2 pawn for either player, so even equal games start a bit lopsided.
 4. Play the rest normally, with a chess clock if you chose one. Draw offers, resign, and rematch
-   (colors swap) are built in. Running out of time loses, unless the opponent can't possibly mate.
+   (colors swap; a new opening or **the same opening again**) are built in. Running out of time loses, unless the opponent can't possibly mate.
 5. See the material score (pawn 1, knight/bishop 3, rook 5, queen 9) next to each player, open
    **📖 Learn this opening** for its name, ECO code, ideas and links, and click any move to replay the game.
 6. **Help during the game**: each player gets **💡 best-move hints** (default 3) and **↶ takebacks**
    (default 1), adjustable when you create the game. A takeback works even after your opponent has replied
-   (it undoes both moves). The opening moves the engine played can't be taken back.
+   (it undoes both moves). The opening moves the engine played can't be taken back. Each hint explains
+   **why** it's the best move, in plain words.
+7. **📊 Game review** after the game: every move is labeled like on chess.com — Brilliant !!, Great !,
+   Best ★, Excellent, Good, Inaccuracy ?!, Mistake ?, Miss, Blunder ?? — with a plain-language
+   explanation, the better move, an evaluation graph, accuracy for both players, PGN copy and a Lichess link.
+8. **⚙️ Settings**: sounds, premoves (online and vs computer), dark / light theme, and five board colors.
 
 **Install it as an app:** click **⬇ Install app** (Chrome, Edge, Android), or on iPhone use Safari → Share →
 Add to Home Screen. After the first visit, vs-computer and same-device games work offline.
@@ -53,7 +60,7 @@ python3 -m http.server 8000
 
 ## Ideas for later
 
-Server-backed online games (Firebase), time-odds handicap, sounds, premoves, chat, PGN export, light theme.
+Server-backed online games (Firebase), nickname sign-in with game history and a friends scoreboard, chat.
 
 ## License
 

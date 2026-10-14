@@ -176,13 +176,19 @@ function weightedPick(items, weights) {
  * @param {string[]} [o.avoid]  recent openings (space-joined SAN prefixes) not to repeat
  * @returns {Promise<{moves:string[], fen:string, evalWhite:number, target:number, favored:'w'|'b'|null}>}
  */
-export async function simulateOpening({ whiteRating, blackRating, turns, style = 30, avoid = [], onMove }) {
+export async function simulateOpening({ whiteRating, blackRating, turns, style = 30, avoid = [], onMove, targetWhite = null, positional = false }) {
   const sf = getEngine();
   await loadOpenings();
   const chess = new Chess();
-  const gap = whiteRating - blackRating;          // > 0 → White is stronger
-  const target = targetAdvantage(gap);
-  const favored = target === 0 ? null : (gap > 0 ? 'b' : 'w');
+  // targetWhite: the edge to create, in centipawns from White's point of view (+ = White better).
+  // If not given, fall back to the rating rule.
+  if (targetWhite == null) {
+    const gap = whiteRating - blackRating;          // > 0 → White is stronger
+    const t = targetAdvantage(gap);
+    targetWhite = gap > 0 ? -t : t;
+  }
+  const target = Math.abs(Math.round(targetWhite));
+  const favored = target < 5 ? null : (targetWhite > 0 ? 'w' : 'b');
   const totalPlies = turns * 2;
   const s = Math.max(0, Math.min(100, style)) / 100;
   const avoidSet = new Set(avoid);
@@ -222,7 +228,9 @@ export async function simulateOpening({ whiteRating, blackRating, turns, style =
       const count = bookCount([...sans, mv.san]);
       chess.undo();
       const kingWalk = mv.piece === 'k' && !mv.flags.includes('k') && !mv.flags.includes('q');
-      cands.push({ ...m, san: mv.san, loss, book: count > 0, pop: Math.log2(1 + count), kingWalk, earlyQueen: mv.piece === 'q' && ply < 12 && !mv.captured });
+      // Positional handicaps: does this move give away material along the engine's line?
+      const givesMaterial = positional && loss > 25 ? materialSwing(chess, m.pv, side) < 0 : false;
+      cands.push({ ...m, san: mv.san, loss, book: count > 0, pop: Math.log2(1 + count), kingWalk, givesMaterial, earlyQueen: mv.piece === 'q' && ply < 12 && !mv.captured });
     }
     if (!cands.length) cands.push({ ...options[0], loss: 0, book: false, pop: 0, kingWalk: false, san: null });
 
@@ -243,6 +251,7 @@ export async function simulateOpening({ whiteRating, blackRating, turns, style =
       else w *= 1 + (s - 0.6) * 12 / (1 + c.pop);             // crazy: favour rare / unknown moves
       if (c.kingWalk && s < 0.9) w *= 0.1;                    // king walks look silly
       if (c.earlyQueen && s < 0.5) w *= 0.3;                  // so do early queen trips
+      if (c.givesMaterial) w *= 0.08;                         // positional mode: concede space/time, not pieces
       return w;
     });
     const choice = weightedPick(pool, weights);
@@ -258,5 +267,21 @@ export async function simulateOpening({ whiteRating, blackRating, turns, style =
     const [top] = await sf.analyse(chess.fen(), { multipv: 1, depth: 12 });
     evalWhite = chess.turn() === 'w' ? top.score : -top.score;
   }
-  return { moves: sans, fen: chess.fen(), evalWhite, target, favored };
+  const mat = c => { let n = 0; for (const r of c.board()) for (const q of r) if (q) n += (q.color === 'w' ? 1 : -1) * PIECE[q.type]; return n; };
+  return { moves: sans, fen: chess.fen(), evalWhite, target, favored, materialWhite: mat(chess) };
+}
+
+const PIECE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+// Material change for `side` after playing the first plies of a PV (from the current position).
+function materialSwing(chess, pv, side) {
+  if (!pv || pv.length < 2) return 0;
+  const c = new Chess(chess.fen());
+  const count = () => { let n = 0; for (const r of c.board()) for (const q of r) if (q) n += (q.color === side ? 1 : -1) * PIECE[q.type]; return n; };
+  const start = count();
+  const plies = Math.min(4, pv.length - (pv.length % 2));
+  for (let i = 0; i < plies; i++) {
+    const u = pv[i];
+    try { c.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] }); } catch { break; }
+  }
+  return count() - start;
 }

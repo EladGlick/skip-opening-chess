@@ -2,6 +2,9 @@ import { Chess } from './vendor/chess.js';
 import { Chessground } from './vendor/chessground/chessground.min.js';
 import { simulateOpening, getEngine, getBotEngine, botMove, quickEval, targetAdvantage, hintAnalysis } from './engine.js';
 import { explainHint } from './explain.js';
+import { planHandicap, learnK, edgeWords } from './handicap.js';
+import { play, soundFor, setSoundEnabled } from './sound.js';
+import { analyseGame, CLASSES, SUMMARY_ORDER, KEY_CLASSES, toPgn, lichessPgnUrl } from './review.js';
 import { loadOpenings, identify, describe, styleLabel, lichessOpeningUrl, lichessAnalysisUrl, wikipediaUrl } from './openings.js';
 
 /* ------------------------------------------------------------------ */
@@ -69,10 +72,47 @@ let botThinking = false;
 let uiNote = null;         // short-lived message shown under the buttons
 let hint = null;           // { game, n, from, to, san } — the best move currently shown to this player
 let hintBusy = false;
+let review = null;         // { key, status: 'running'|'done'|'error', done, total, result }
 let hintHidden = '';       // `${game}|${n}` of a hint card the player closed (the arrow stays)
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const profile = store.get('profile') || {};
+
+/* ------------------------------------------------------------------ */
+/* Preferences: sound, premoves, theme, board colors                   */
+/* ------------------------------------------------------------------ */
+const prefs = { sound: true, premove: true, theme: 'auto', board: 'green', ...(store.get('prefs') || {}) };
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+function applyPrefs() {
+  const theme = prefs.theme === 'auto' ? (darkQuery.matches ? 'dark' : 'light') : prefs.theme;
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.dataset.board = prefs.board;
+  document.querySelector('meta[name=theme-color]')?.setAttribute('content', theme === 'light' ? '#f1f0ec' : '#1c1d21');
+  setSoundEnabled(prefs.sound);
+  $('pref-sound').checked = prefs.sound;
+  $('pref-premove').checked = prefs.premove;
+  for (const r of document.querySelectorAll('input[name=pref-theme]')) r.checked = r.value === prefs.theme;
+  for (const b of document.querySelectorAll('#pref-board [data-board]')) b.classList.toggle('on', b.dataset.board === prefs.board);
+}
+function setPref(k, v) {
+  prefs[k] = v;
+  store.set('prefs', prefs);
+  applyPrefs();
+  if (k === 'premove') { if (!v) cg?.cancelPremove(); lastRenderedKey = ''; render(); }
+}
+function initPrefs() {
+  applyPrefs();
+  darkQuery.addEventListener?.('change', () => { if (prefs.theme === 'auto') applyPrefs(); });
+  const pop = $('settings'), btn = $('settings-btn');
+  const toggle = open => { pop.hidden = !open; btn.setAttribute('aria-expanded', String(open)); };
+  btn.onclick = e => { e.stopPropagation(); toggle(pop.hidden); };
+  document.addEventListener('click', e => { if (!pop.hidden && !pop.contains(e.target) && e.target !== btn) toggle(false); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') toggle(false); });
+  $('pref-sound').onchange = e => { setPref('sound', e.target.checked); play('move'); };
+  $('pref-premove').onchange = e => setPref('premove', e.target.checked);
+  for (const r of document.querySelectorAll('input[name=pref-theme]')) r.onchange = () => setPref('theme', r.value);
+  for (const b of document.querySelectorAll('#pref-board [data-board]')) b.onclick = () => setPref('board', b.dataset.board);
+}
 
 /* ------------------------------------------------------------------ */
 /* Screens                                                             */
@@ -349,14 +389,16 @@ function pickWhite() {
   return Math.random() < 0.5 ? 'host' : 'guest';
 }
 
-function startGame(white) {
+function startGame(white, replay = null) {
   viewPly = null; stopAutoplay();
   Object.assign(state, {
     white, phase: 'simulating', moves: [], simCount: 0, sim: null, clock: null,
     result: null, drawOffer: null, rematch: { host: false, guest: false },
     used: freshUsed(), lastTakeback: null, undos: 0,
+    replay, rematchSame: false,
   });
   hint = null;
+  review = null;
   broadcast();
   runSimulation();
 }
@@ -369,13 +411,19 @@ async function runSimulation() {
   const whiteRating = rating('host') ?? rating('guest');
   const blackRating = state.white === 'host' ? state.guest.rating : state.host.rating;
   try {
-    if (state.turns > 0) {
+    if (state.replay?.moves?.length) {
+      // rematch with the same opening: replay the moves the engine chose last game
+      for (const san of state.replay.moves) { state.moves.push(san); broadcast(); await sleep(120); }
+      state.sim = state.replay.sim || { evalWhite: 0, target: 0, favored: null };
+    } else if (state.turns > 0) {
       const recent = store.get('recentStarts') || [];
+      const plan = planHandicap({ whiteRating, blackRating, results: allResults() });
       const res = await simulateOpening({
         whiteRating, blackRating, turns: state.turns, style: state.style ?? 25, avoid: recent,
+        targetWhite: plan.targetWhite, positional: plan.positional,
         onMove: ({ san }) => { state.moves.push(san); broadcast(); },
       });
-      state.sim = { evalWhite: res.evalWhite, target: res.target, favored: res.favored };
+      state.sim = { evalWhite: res.evalWhite, target: res.target, favored: res.favored, materialWhite: res.materialWhite, plan };
       const starts = [res.moves.slice(0, 4).join(' '), res.moves.slice(0, 8).join(' ')];
       store.set('recentStarts', [...starts, ...recent].slice(0, 40));
     } else {
@@ -468,10 +516,14 @@ function actOn(who, msg) {
     }
     case 'rematch':
       if (state.phase !== 'over') return;
+      // the first request decides the kind: a fresh opening, or the same one again
+      if (!state.rematch.host && !state.rematch.guest) state.rematchSame = !!msg.same;
       state.rematch[who] = true;
       if (state.mode !== 'online' || (state.rematch.host && state.rematch.guest)) {
+        const replay = state.rematchSame && state.simCount
+          ? { moves: state.moves.slice(0, state.simCount), sim: state.sim } : null;
         state.game++;
-        startGame(state.white === 'host' ? 'guest' : 'host'); // swap colors
+        startGame(state.white === 'host' ? 'guest' : 'host', replay); // swap colors
         return;
       }
       break;
@@ -480,6 +532,29 @@ function actOn(who, msg) {
   }
   broadcast();
 }
+
+/* ---------- results (feed the handicap learning and the scoreboard) ---------- */
+function allResults() { return store.get('results') || []; }
+function recordResult() {
+  if (role !== 'host' || state.phase !== 'over' || !state.result || !state.white) return;
+  const rid = `${state.id}_${state.game}`;
+  const list = allResults();
+  if (list.some(r => r.rid === rid)) return;
+  const W = playerOf('w'), B = playerOf('b');
+  const r = state.result;
+  const entry = {
+    rid, date: Date.now(), mode: state.mode,
+    white: { name: W.name, rating: W.rating, uid: W.uid || null }, black: { name: B.name, rating: B.rating, uid: B.uid || null },
+    gap: W.rating - B.rating, result: !r.winner ? 0.5 : r.winner === 'w' ? 1 : 0, reason: r.reason,
+    turns: state.turns, simCount: state.simCount, plies: state.moves.length,
+    targetWhite: state.sim?.plan?.targetWhite ?? null, jitter: state.sim?.plan?.jitter ?? 0,
+    positional: !!state.sim?.plan?.positional, evalWhite: state.sim?.evalWhite ?? null,
+  };
+  list.push(entry);
+  store.set('results', list.slice(-500));
+  onResultRecorded(entry);
+}
+function onResultRecorded() { /* replaced when online sync is available */ }
 
 function endGame(result) {
   if (state.clock?.since) {
@@ -615,6 +690,11 @@ function updateClocks() {
 setInterval(() => {
   if (!state) return;
   updateClocks();
+  // ticking when your own clock is under 10 seconds
+  if (state.phase === 'playing' && state.clock?.since && state.mode !== 'local' && liveTurn === myColor()) {
+    const ms = clockRemaining(liveTurn);
+    if (ms != null && ms < 10000 && ms > 0 && Math.ceil(ms / 1000) !== lastTick) { lastTick = Math.ceil(ms / 1000); play('tick'); }
+  }
   // the host (or the single device in offline modes) decides when a flag falls
   if (role === 'host' && state.phase === 'playing' && state.clock?.since) {
     const t = chessFrom(state.moves).turn();
@@ -808,6 +888,27 @@ function askPromotion(color) {
   });
 }
 
+// Sounds follow the live game: one per new move, one when the game starts and ends.
+let soundKey = null, lastUndos = 0, lastTick = 0;
+function playSounds(live) {
+  const n = state.moves.length;
+  const key = { game: state.game, n, phase: state.phase };
+  const prev = soundKey;
+  soundKey = key;
+  if (!prev || prev.game !== key.game) return;             // first render of this game: stay quiet
+  if (key.phase === 'playing' && prev.phase === 'simulating') { play('start'); return; }
+  if (key.phase === 'over' && prev.phase !== 'over') {
+    const w = state.result?.winner;
+    const mine = myColor();
+    play(!w ? 'draw' : state.mode === 'local' || w === mine ? 'win' : 'lose');
+    return;
+  }
+  if (key.phase === 'playing' && n > prev.n) {
+    const last = live.history({ verbose: true }).pop();
+    play(soundFor(last, live.inCheck()));
+  }
+}
+
 function render() {
   if (!state) return;
   if (role === 'host' && !state.guest) { renderWait(); return; }
@@ -824,6 +925,8 @@ function render() {
   if (state.mode === 'local') base = state.autoFlip ? live.turn() : (state.white === 'host' ? 'w' : 'b');
   const orientation = flipped ? other(base) : base;
   const canMove = viewPly == null && state.phase === 'playing' && live.turn() === mine;
+  // premoves: online and vs computer, while it's the other side's turn
+  const canPremove = prefs.premove && state.mode !== 'local' && viewPly == null && state.phase === 'playing' && live.turn() !== mine;
   const hist = c.history({ verbose: true });
   const last = hist[hist.length - 1];
 
@@ -842,12 +945,17 @@ function render() {
       lastMove: last ? [last.from, last.to] : undefined,
       check: c.inCheck(),
       viewOnly: false,
-      movable: { color: canMove ? (mine === 'w' ? 'white' : 'black') : undefined, dests },
+      movable: { color: canMove || canPremove ? (mine === 'w' ? 'white' : 'black') : undefined, dests },
+      premovable: { enabled: canMove || canPremove },
     });
+    if (!canMove && !canPremove) cg.cancelPremove();
+    if ((state.undos || 0) !== lastUndos) { lastUndos = state.undos || 0; cg.cancelPremove(); }
+    if (canMove) setTimeout(() => cg.playPremove(), 0);
   }
+  playSounds(live);
   const showHint = hint && hint.game === state.game && hint.n === state.moves.length && viewPly == null && state.phase === 'playing';
   if (!showHint) hint = null;
-  cg.setAutoShapes(showHint ? [{ orig: hint.from, dest: hint.to, brush: 'green' }] : []);
+  cg.setAutoShapes(showHint ? [{ orig: hint.from, dest: hint.to, brush: 'green' }] : reviewShapes());
   const vb = $('viewing');
   vb.hidden = viewPly == null;
   if (viewPly != null) {
@@ -862,6 +970,8 @@ function render() {
   renderLearn();
   renderMoves();
   renderReview();
+  renderAnalysis();
+  if (state.phase === 'over') recordResult();
   renderActions(mine);
   renderOverlay(mine);
   updateClocks();
@@ -1006,26 +1116,43 @@ function renderHandicap() {
   const el = $('handicap');
   if (!state.sim || state.turns === 0) { el.hidden = true; return; }
   el.hidden = false;
-  const { evalWhite, target, favored } = state.sim;
+  const { evalWhite, favored, materialWhite, plan } = state.sim;
   const gap = Math.abs(state.host.rating - state.guest.rating);
-  const lead = evalWhite === 0 ? 'Equal position' : `${colorName(evalWhite > 0 ? 'w' : 'b')} ${fmtEval(Math.abs(evalWhite))}`;
   el.innerHTML = '';
-  const p = document.createElement('div');
-  if (favored) {
-    const fav = playerOf(favored);
-    p.innerHTML = `Rating gap <b>${gap}</b> → opening tilted toward <b></b> (target ≈ ${fmtEval(target)}).<br>Engine eval after the opening: <b>${lead}</b>`;
-    p.querySelectorAll('b')[1].textContent = fav.name;
+  const add = (html, ...texts) => {
+    const p = document.createElement('p');
+    p.innerHTML = html;
+    p.querySelectorAll('i').forEach((n, k) => { n.replaceWith(document.createTextNode(texts[k] ?? '')); });
+    el.appendChild(p);
+  };
+  const lower = state.host.rating === state.guest.rating ? null : playerOf(state.host.rating < state.guest.rating ? (state.white === 'host' ? 'w' : 'b') : (state.white === 'host' ? 'b' : 'w'));
+  if (plan) {
+    if (plan.base) {
+      const how = plan.learnedFrom
+        ? `learned from <b>${plan.learnedFrom}</b> game${plan.learnedFrom === 1 ? '' : 's'} so far`
+        : 'starting rule — it adapts as you play';
+      add(`Rating gap <b>${gap}</b> → <b><i></i></b> gets ${fmtEval(plan.base)} (${how}).`, lower?.name || '');
+    } else {
+      add(`Ratings are close (gap <b>${gap}</b>) — no rating handicap.`);
+    }
+    if (Math.abs(plan.jitter) >= 5) add(`🎲 Random bonus: ${fmtEval(Math.abs(plan.jitter))} for <b><i></i></b>.`, playerOf(plan.jitter > 0 ? 'w' : 'b').name);
+    const mat = materialWhite || 0;
+    const kind = mat === 0 ? 'Positional — no material was handed over.' : `Includes material: <b><i></i></b> is ${Math.abs(mat)} point${Math.abs(mat) === 1 ? '' : 's'} up.`;
+    add(`Type of edge: ${kind}`, playerOf(mat > 0 ? 'w' : 'b').name);
+  } else if (favored) {
+    add(`Rating gap <b>${gap}</b> → opening tilted toward <b><i></i></b>.`, playerOf(favored).name);
   } else {
-    p.innerHTML = `Ratings are close — a fair opening was simulated.<br>Engine eval: <b>${lead}</b>`;
+    add('Ratings are close — a fair opening was simulated.');
   }
+  const lead = Math.abs(evalWhite) < 15 ? 'Equal position' : `<i></i> has ${edgeWords(evalWhite)} (${fmtEval(Math.abs(evalWhite))})`;
+  add(`After the opening: <b>${lead}</b>`, playerOf(evalWhite > 0 ? 'w' : 'b').name);
   const bar = document.createElement('div');
   bar.className = 'evalbar';
   bar.title = 'Engine eval after the opening (white = White’s share)';
   const fill = document.createElement('div');
-  const pct = 50 + 50 * Math.tanh(evalWhite / 400);
-  fill.style.width = pct + '%';
+  fill.style.width = (50 + 50 * Math.tanh(evalWhite / 400)) + '%';
   bar.appendChild(fill);
-  el.append(p, bar);
+  el.appendChild(bar);
 }
 
 function renderMoves() {
@@ -1047,6 +1174,10 @@ function renderMoves() {
       const shown = viewPly == null ? total : viewPly;
       m.className = 'm' + (j < simEnd ? ' sim' : '') + (j === shown - 1 ? ' last' : '');
       m.textContent = state.moves[j] || '';
+      if (reviewReady() && j >= review.result.from) {
+        const rp = review.result.plies[j - review.result.from];
+        if (rp && rp.cls !== 'best' && rp.cls !== 'excellent' && rp.cls !== 'good' && rp.cls !== 'forced') m.appendChild(badge(rp.cls));
+      }
       if (state.moves[j] && state.phase !== 'simulating') {
         m.classList.add('click');
         m.onclick = () => goTo(j + 1);
@@ -1106,6 +1237,226 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') { e.preventDefault(); $('nav-prev').click(); }
   if (e.key === 'ArrowRight') { e.preventDefault(); $('nav-next').click(); }
 });
+
+/* ---------- after-game review ---------- */
+const reviewKey = () => (state ? `${state.id}|${state.game}|${state.moves.join(' ')}` : '');
+const reviewReady = () => review && review.key === reviewKey() && review.status === 'done';
+const reviewedPly = () => (viewPly ?? state.moves.length) - 1;
+
+function startReview() {
+  if (!state || state.phase !== 'over' || state.moves.length <= state.simCount) return;
+  const key = reviewKey();
+  if (review && review.key === key && review.status !== 'error') return;
+  const cached = store.get('review:' + state.id);
+  if (cached && cached.key === key) { review = { key, status: 'done', result: cached.result }; render(); return; }
+  const mine = review = { key, status: 'running', done: 0, total: state.moves.length - state.simCount + 1 };
+  analyseGame(state.moves, state.simCount, {
+    viewer: state.mode === 'local' ? null : myColor(),
+    names: { w: playerOf('w').name, b: playerOf('b').name },
+    onProgress: (d, t) => { if (review === mine) { mine.done = d; mine.total = t; renderAnalysis(); } },
+    isCancelled: () => review !== mine,
+  }).then(res => {
+    if (review !== mine || !res) return;
+    mine.status = 'done';
+    mine.result = res;
+    try { store.set('review:' + state.id, { key, result: res }); } catch { /* storage full: fine */ }
+    render();
+  }).catch(err => {
+    console.error('review failed', err);
+    if (review === mine) { mine.status = 'error'; renderAnalysis(); }
+  });
+}
+
+function openSection(id) {
+  for (const sec of document.querySelectorAll('.sec')) {
+    sec.classList.toggle('open', sec.id === id);
+    sec.querySelector('.sec-head').setAttribute('aria-expanded', sec.id === id);
+  }
+}
+function openReview() {
+  startReview();
+  openSection('review-sec');
+  if (viewPly == null && reviewReady()) {
+    // start at the first key moment, if there is one
+    const k = review.result.plies.find(p => KEY_CLASSES.has(p.cls));
+    if (k) { goTo(k.ply + 1); return; }
+  }
+  render();
+}
+
+// Arrows and a badge on the board for the move being reviewed.
+function reviewShapes() {
+  if (!reviewReady() || state.phase !== 'over') return [];
+  const r = reviewedPly();
+  const p = review.result.plies[r - review.result.from];
+  if (!p) return [];
+  const c = CLASSES[p.cls];
+  const shapes = [];
+  if (p.bestUci && p.bestUci !== p.uci && !['best', 'brilliant', 'great', 'forced'].includes(p.cls)) {
+    shapes.push({ orig: p.bestUci.slice(0, 2), dest: p.bestUci.slice(2, 4), brush: 'green' });
+  }
+  if (['blunder', 'mistake', 'miss'].includes(p.cls)) shapes.push({ orig: p.from, dest: p.to, brush: 'red' });
+  else if (p.cls === 'inaccuracy') shapes.push({ orig: p.from, dest: p.to, brush: 'yellow' });
+  const sym = c.sym.replace('&', '&amp;').replace('<', '&lt;');
+  shapes.push({
+    orig: p.to,
+    customSvg: {
+      center: 'orig',
+      html: `<g transform="translate(70 -2)"><circle cx="16" cy="16" r="17" fill="${c.color}" stroke="#fff" stroke-width="3"/>`
+        + `<text x="16" y="23" text-anchor="middle" font-size="${sym.length > 1 ? 17 : 21}" font-weight="800" font-family="Inter, system-ui, sans-serif" fill="#fff">${sym}</text></g>`,
+    },
+  });
+  return shapes;
+}
+
+function badge(cls) {
+  const c = CLASSES[cls];
+  const b = document.createElement('span');
+  b.className = 'rv-badge';
+  b.style.background = c.color;
+  b.textContent = c.sym;
+  b.title = c.label;
+  return b;
+}
+
+function renderAnalysis() {
+  const sec = $('review-sec');
+  const over = state.phase === 'over' && state.moves.length > state.simCount;
+  sec.hidden = !over;
+  if (!over) return;
+  if (!review || review.key !== reviewKey()) { setTimeout(startReview, 400); }
+  const sub = $('review-sub');
+  const body = $('review-body');
+  body.innerHTML = '';
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+  if (!review || review.status === 'running') {
+    const pct = review ? Math.round((100 * review.done) / Math.max(1, review.total)) : 0;
+    sub.textContent = `Analysing… ${pct}%`;
+    const bar = el('div', 'rv-progress');
+    const fill = el('div');
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    body.append(bar, el('p', 'rv-note', 'The engine is checking every move of your game. You can keep looking around meanwhile.'));
+    return;
+  }
+  if (review.status === 'error') {
+    sub.textContent = 'Couldn’t analyse';
+    body.append(el('p', 'rv-note', 'The engine failed to load. Check your connection and try again.'), btn('Try again', 'small', () => { review = null; startReview(); }));
+    return;
+  }
+  const res = review.result;
+  const fmt = a => (a == null ? '–' : a.toFixed(1));
+  sub.textContent = `Accuracy ${fmt(res.accuracy.w)} · ${fmt(res.accuracy.b)}`;
+
+  // accuracy per player
+  const acc = el('div', 'rv-acc');
+  for (const col of ['w', 'b']) {
+    const pl = el('div', 'rv-player');
+    const av = el('span', 'mini-avatar ' + col);
+    const nm = el('span', 'rv-name', playerOf(col).name);
+    const num = el('span', 'rv-num', fmt(res.accuracy[col]));
+    pl.append(av, nm, num, el('span', 'rv-cap', 'accuracy'));
+    acc.appendChild(pl);
+  }
+  body.appendChild(acc);
+
+  // eval graph (White's winning chances), click to jump
+  const W = 300, H = 64;
+  const n = res.evals.length;
+  const x = i => (n <= 1 ? 0 : (i / (n - 1)) * W);
+  const y = cp => H - (1 / (1 + Math.exp(-0.00368208 * cp))) * H;
+  let d = `M0 ${H} `;
+  res.evals.forEach((e, i) => { d += `L${x(i).toFixed(1)} ${y(e).toFixed(1)} `; });
+  d += `L${W} ${H} Z`;
+  const cur = reviewedPly() + 1 - res.from;
+  let dots = '';
+  for (const p of res.plies) {
+    if (!KEY_CLASSES.has(p.cls)) continue;
+    const i = p.ply + 1 - res.from;
+    dots += `<circle cx="${x(i).toFixed(1)}" cy="${y(res.evals[i]).toFixed(1)}" r="3.4" fill="${CLASSES[p.cls].color}" stroke="#1b1c20" stroke-width="1"/>`;
+  }
+  const graph = el('div', 'rv-graph');
+  graph.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="Evaluation graph">`
+    + `<rect width="${W}" height="${H}" fill="#3a3c43"/><path d="${d}" fill="#e8e6df"/>`
+    + `<line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="#888" stroke-width="0.6" stroke-dasharray="3 3"/>`
+    + (cur >= 0 && cur < n ? `<line x1="${x(cur)}" x2="${x(cur)}" y1="0" y2="${H}" stroke="#81b64c" stroke-width="2"/>` : '')
+    + dots + '</svg>';
+  graph.onclick = e => {
+    const r = graph.getBoundingClientRect();
+    const i = Math.round(((e.clientX - r.left) / r.width) * (n - 1));
+    goTo(res.from + i);
+  };
+  body.appendChild(graph);
+
+  // the move being looked at
+  const card = el('div', 'rv-card');
+  const r = reviewedPly();
+  const p = res.plies[r - res.from];
+  if (!p) {
+    card.append(el('p', 'rv-note', r < res.from
+      ? 'These moves were played by the engine. Step forward to the moves you and your opponent chose.'
+      : 'Pick a move to see how it was judged.'));
+  } else {
+    const head = el('div', 'rv-head');
+    const num = `${Math.floor(p.ply / 2) + 1}${p.color === 'w' ? '.' : '…'} ${p.san}`;
+    const c = CLASSES[p.cls];
+    const label = el('span', 'rv-label', c.label);
+    label.style.color = c.color;
+    head.append(badge(p.cls), el('b', null, num), label);
+    card.appendChild(head);
+    const who = el('div', 'rv-who', playerOf(p.color).name);
+    card.appendChild(who);
+    for (const t of p.text) card.appendChild(el('p', null, t));
+  }
+  const nav = el('div', 'rv-nav');
+  const prev = btn('‹', 'small ghost', () => goTo(r));
+  prev.disabled = r < res.from;
+  const nextKey = res.plies.find(q => q.ply > r && KEY_CLASSES.has(q.cls));
+  const key = btn(nextKey ? 'Next key moment ›' : 'No more key moments', 'small', () => nextKey && goTo(nextKey.ply + 1));
+  key.disabled = !nextKey;
+  const next = btn('›', 'small ghost', () => goTo(r + 2));
+  next.disabled = r + 1 >= state.moves.length;
+  nav.append(prev, key, next);
+  card.appendChild(nav);
+  body.appendChild(card);
+
+  // counts per class
+  const table = el('div', 'rv-table');
+  for (const k of SUMMARY_ORDER) {
+    const nw = res.counts.w[k], nb = res.counts.b[k];
+    if (!nw && !nb && !['best', 'blunder', 'mistake', 'inaccuracy'].includes(k)) continue;
+    const row = el('div', 'rv-row');
+    const lw = el('span', 'rv-n', String(nw));
+    const lab = el('span', 'rv-cls');
+    lab.append(badge(k), document.createTextNode(CLASSES[k].label));
+    const lb = el('span', 'rv-n', String(nb));
+    if (nw) lw.style.color = CLASSES[k].color;
+    if (nb) lb.style.color = CLASSES[k].color;
+    // tap a row: jump to the first such move
+    row.onclick = () => { const q = res.plies.find(z => z.cls === k); if (q) goTo(q.ply + 1); };
+    row.append(lw, lab, lb);
+    table.appendChild(row);
+  }
+  body.appendChild(table);
+
+  // export
+  const ex = el('div', 'rv-export');
+  const resultTag = !state.result ? '*' : !state.result.winner ? '1/2-1/2' : state.result.winner === 'w' ? '1-0' : '0-1';
+  const copy = btn('Copy PGN', 'small ghost', async () => {
+    const pgn = toPgn(state.moves, { white: playerOf('w').name, black: playerOf('b').name, result: resultTag });
+    try { await navigator.clipboard.writeText(pgn); copy.textContent = 'Copied!'; } catch { copy.textContent = 'Copy failed'; }
+    setTimeout(() => (copy.textContent = 'Copy PGN'), 1500);
+  });
+  const li = document.createElement('a');
+  li.className = 'btn small ghost';
+  li.href = lichessPgnUrl(state.moves);
+  li.target = '_blank';
+  li.rel = 'noopener';
+  li.textContent = 'Open in Lichess ↗';
+  ex.append(copy, li);
+  body.appendChild(ex);
+}
 
 /* ---------- learn about the opening ---------- */
 let learnKey = '';
@@ -1238,7 +1589,7 @@ function renderHelpButtons(mine, playing) {
   const cfg = state.help || { hints: 0, takebacks: 0 };
   const me = whoOf(mine);
   const isBot = state.mode === 'bot' && playerOf(mine).bot;
-  const off = state.phase === 'simulating' || isBot;
+  const off = state.phase !== 'playing' || isBot;
   const live = viewPly == null;
   const myTurn = liveTurn === mine;
   const hLeft = helpLeft(me, 'hints'), tLeft = helpLeft(me, 'takebacks');
@@ -1310,13 +1661,18 @@ function renderOverlay(mine) {
   const meReq = state.rematch[role];
   const themReq = state.rematch[role === 'host' ? 'guest' : 'host'];
   const online = state.mode === 'online';
-  const rb = btn(online ? (meReq ? 'Waiting for friend…' : themReq ? 'Accept rematch' : 'Rematch (swap colors)') : 'Play again (swap colors)', 'primary', () => act({ t: 'rematch' }));
+  const kind = state.rematchSame ? 'same opening' : 'new opening';
+  const rb = btn(online ? (meReq ? 'Waiting for friend…' : themReq ? `Accept rematch (${kind})` : 'Rematch · new opening') : 'Play again · new opening', 'primary', () => act({ t: 'rematch', same: false }));
   rb.disabled = online && meReq;
+  const same = btn(online ? 'Rematch · same opening' : 'Same opening again', '', () => act({ t: 'rematch', same: true }));
+  same.title = 'Replay the same engine opening with colors swapped';
+  same.hidden = !state.simCount || (online && (meReq || themReq));
   const info = document.createElement('p');
-  info.textContent = online && themReq && !meReq ? 'Your friend wants a rematch!' : '';
+  info.textContent = online && themReq && !meReq ? `Your friend wants a rematch with a ${kind}!` : 'Colors swap for the next game.';
   const close = btn('View board', 'ghost', () => { ov.dataset.dismissed = `${state.game}`; ov.hidden = true; });
   const fresh = btn('New game', 'ghost', () => { location.href = location.pathname + (SIGNAL ? `?signal=${SIGNAL}` : ''); });
-  box.append(h, p, info, rb, close, fresh);
+  const rv = btn('📊 Review game', '', () => { ov.dataset.dismissed = `${state.game}`; ov.hidden = true; openReview(); });
+  box.append(h, p, info, rb, same, rv, close, fresh);
   ov.appendChild(box);
 }
 
@@ -1358,7 +1714,7 @@ for (const head of document.querySelectorAll('.sec-head')) {
       other.classList.toggle('open', other === sec ? open : false);
       other.querySelector('.sec-head').setAttribute('aria-expanded', other.classList.contains('open'));
     }
-    if (!open && sec.id === 'learn') { // closing the opening shows the moves again
+    if (!open && sec.id !== 'moves-sec') { // closing another section shows the moves again
       const mv = $('moves-sec'); mv.classList.add('open'); mv.querySelector('.sec-head').setAttribute('aria-expanded', 'true');
     }
   });
@@ -1409,6 +1765,7 @@ function syncOnline() {
 window.addEventListener('online', () => { syncOnline(); if (state?.mode === 'online') toast('Back online.'); });
 window.addEventListener('offline', () => { syncOnline(); if (state?.mode === 'online') toast('You are offline. The game will reconnect when the internet is back.'); });
 for (const r of document.querySelectorAll('#create-form input[name=mode]')) r.addEventListener('change', syncOnline);
+initPrefs();
 syncOnline();
 if (!gameId) {
   initCreate();
@@ -1432,4 +1789,4 @@ if (!gameId) {
 }
 
 // exposed for debugging / tests
-window.__skip = { get state() { return state; }, get role() { return role; }, targetAdvantage };
+window.__skip = { get state() { return state; }, get role() { return role; }, targetAdvantage, play: (f, t, pr) => playMove(f, t, pr) };
